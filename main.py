@@ -1,15 +1,91 @@
 import os
 import asyncio
 import requests
+import json
+import re
 from telegram import Bot
+from datetime import datetime
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 CHECK_INTERVAL = 180
-SEARCH_URL = "https://www.marktplaats.nl/l/auto-s/q/aygo/"
+MAX_PRICE = 5000
+MAX_KM = 150000
+MIN_SCORE = 4
 
-seen_links = set()
+SEARCH_URL = "https://www.marktplaats.nl/l/auto-s/"
+
+MODELS = [
+    "aygo",
+    "c1",
+    "107",
+    "up",
+    "polo"
+]
+
+KEYWORDS = [
+    "motor kapot",
+    "loopt niet",
+    "start niet",
+    "distributie",
+    "ketting",
+    "tikken",
+    "rook",
+    "schade",
+    "export"
+]
+
+SEEN_FILE = "seen.json"
+
+
+# =========================
+
+def load_seen():
+    try:
+        with open(SEEN_FILE, "r") as f:
+            return set(json.load(f))
+    except:
+        return set()
+
+
+def save_seen(seen):
+    with open(SEEN_FILE, "w") as f:
+        json.dump(list(seen), f)
+
+
+def extract_price(text):
+    match = re.search(r'€\s?([\d\.]+)', text)
+    if match:
+        return int(match.group(1).replace(".", ""))
+    return None
+
+
+def extract_km(text):
+    match = re.search(r'(\d{1,3}\.\d{3})\s?km', text.lower())
+    if match:
+        return int(match.group(1).replace(".", ""))
+    return None
+
+
+def calculate_score(price, km, description):
+    score = 0
+
+    if price and price < 2500:
+        score += 2
+
+    if km and km < 120000:
+        score += 2
+
+    if any(k in description.lower() for k in KEYWORDS):
+        score += 2
+
+    return score
+
+
+def is_target_model(title):
+    title = title.lower()
+    return any(model in title for model in MODELS)
 
 
 async def send_telegram(message):
@@ -25,25 +101,71 @@ def get_listings():
     listings = []
     parts = html.split('/v/auto')
 
-    for part in parts[1:6]:
+    for part in parts[1:20]:
         link = "https://www.marktplaats.nl/v/auto" + part.split('"')[0]
         listings.append(link)
 
-    return listings
+    return list(set(listings))
 
+
+def get_detail(url):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, headers=headers)
+    return response.text
+
+
+# =========================
 
 async def run():
-    print("🚗 Auto Alert Live")
+    print("🚗 ULTRA SNIPER LIVE")
+
+    seen_links = load_seen()
 
     while True:
         try:
             print("🔎 Scannen...")
+
             listings = get_listings()
 
             for link in listings:
-                if link not in seen_links:
-                    seen_links.add(link)
-                    await send_telegram(f"🚗 Nieuwe listing:\n{link}")
+
+                if link in seen_links:
+                    continue
+
+                html = get_detail(link)
+
+                price = extract_price(html)
+                km = extract_km(html)
+
+                title_match = re.search(r'<title>(.*?)</title>', html)
+                title = title_match.group(1) if title_match else ""
+
+                if not is_target_model(title):
+                    continue
+
+                if price and price > MAX_PRICE:
+                    continue
+
+                if km and km > MAX_KM:
+                    continue
+
+                score = calculate_score(price, km, html)
+
+                if score >= MIN_SCORE:
+                    message = (
+                        f"🚗 {title}\n"
+                        f"💰 €{price}\n"
+                        f"📏 {km} km\n"
+                        f"📊 Score: {score}\n"
+                        f"🔗 {link}"
+                    )
+
+                    await send_telegram(message)
+                    print("✅ Deal gestuurd")
+
+                seen_links.add(link)
+
+            save_seen(seen_links)
 
             await asyncio.sleep(CHECK_INTERVAL)
 
