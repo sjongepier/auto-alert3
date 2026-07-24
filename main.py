@@ -13,13 +13,10 @@ MAX_PRICE = 5000
 MAX_KM = 150000
 
 MODELS = ["aygo", "c1", "107", "up", "polo"]
-
 SEEN_FILE = "seen.json"
 
 
-# =========================
-# STORAGE
-# =========================
+# ================= STORAGE =================
 
 def load_seen():
     try:
@@ -34,28 +31,7 @@ def save_seen(seen):
         json.dump(list(seen), f)
 
 
-# =========================
-# FILTER HELPERS
-# =========================
-
-def extract_price(html):
-    match = re.search(r'"price":\s*"?(\\d+)"?', html)
-    if match:
-        return int(match.group(1))
-
-    match = re.search(r'€\s?([\d\.]{4,})', html)
-    if match:
-        return int(match.group(1).replace(".", ""))
-
-    return None
-
-
-def extract_km(html):
-    match = re.search(r'(\d{1,3}\.\d{3})\s?km', html.lower())
-    if match:
-        return int(match.group(1).replace(".", ""))
-    return None
-
+# ================= HELPERS =================
 
 def is_target_model(title):
     return any(model in title.lower() for model in MODELS)
@@ -66,65 +42,88 @@ async def send_telegram(message):
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
 
-# =========================
-# SCRAPERS
-# =========================
-
-def scrape_marktplaats():
-    url = "https://www.marktplaats.nl/l/auto-s/"
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    html = requests.get(url, headers=headers).text
-
-    listings = []
-    parts = html.split('/v/auto')
-
-    for part in parts[1:20]:
-        link = "https://www.marktplaats.nl/v/auto" + part.split('"')[0]
-        listings.append(link)
-
-    return list(set(listings))
-
-
-def scrape_schadeautos():
-    url = "https://www.schadeautos.nl/nl/aanbod"
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    html = requests.get(url, headers=headers).text
-
-    links = re.findall(r'href="(/nl/auto/.*?)"', html)
-
-    listings = []
-    for link in links[:20]:
-        listings.append("https://www.schadeautos.nl" + link)
-
-    return list(set(listings))
-
-
-def get_detail(url):
+def get_html(url):
     headers = {"User-Agent": "Mozilla/5.0"}
     return requests.get(url, headers=headers).text
 
 
-# =========================
-# ENGINE
-# =========================
+# ================= MARKTPLAATS =================
 
-async def process_listing(link, seen_links):
+def scrape_marktplaats():
+    url = "https://www.marktplaats.nl/l/auto-s/"
+    html = get_html(url)
+
+    links = re.findall(r'href="(/v/auto[^"]+)"', html)
+
+    unique_links = list(set([
+        "https://www.marktplaats.nl" + link
+        for link in links
+    ]))
+
+    return unique_links[:20]
+
+
+def parse_marktplaats(html):
+    title_match = re.search(r'<title>(.*?)</title>', html)
+    title = title_match.group(1) if title_match else ""
+
+    # JSON-LD structured data (veel betrouwbaarder)
+    price_match = re.search(r'"price":\s*"(\d+)"', html)
+    price = int(price_match.group(1)) if price_match else None
+
+    km_match = re.search(r'"mileageFromOdometer":\s*{\s*"value":\s*(\d+)', html)
+    km = int(km_match.group(1)) if km_match else None
+
+    return title, price, km
+
+
+# ================= SCHADEAUTOS =================
+
+def scrape_schadeautos():
+    url = "https://www.schadeautos.nl/nl/aanbod"
+    html = get_html(url)
+
+    links = re.findall(r'href="(/nl/auto/[^"]+)"', html)
+
+    unique_links = list(set([
+        "https://www.schadeautos.nl" + link
+        for link in links
+    ]))
+
+    return unique_links[:20]
+
+
+def parse_schadeautos(html):
+    title_match = re.search(r'<title>(.*?)</title>', html)
+    title = title_match.group(1) if title_match else ""
+
+    price_match = re.search(r'€\s?([\d\.]+)', html)
+    price = int(price_match.group(1).replace(".", "")) if price_match else None
+
+    km_match = re.search(r'(\d{1,3}\.\d{3})\s?km', html.lower())
+    km = int(km_match.group(1).replace(".", "")) if km_match else None
+
+    return title, price, km
+
+
+# ================= ENGINE =================
+
+async def process_link(link, seen_links):
 
     if link in seen_links:
         return
 
-    html = get_detail(link)
+    html = get_html(link)
 
-    title_match = re.search(r'<title>(.*?)</title>', html)
-    title = title_match.group(1) if title_match else ""
-
-    if not is_target_model(title):
+    if "marktplaats" in link:
+        title, price, km = parse_marktplaats(html)
+    elif "schadeautos" in link:
+        title, price, km = parse_schadeautos(html)
+    else:
         return
 
-    price = extract_price(html)
-    km = extract_km(html)
+    if not title or not is_target_model(title):
+        return
 
     if price and price > MAX_PRICE:
         return
@@ -136,7 +135,7 @@ async def process_listing(link, seen_links):
         f"🚗 {title}\n"
         f"💰 €{price}\n"
         f"📏 {km} km\n"
-        f"🌍 {link}"
+        f"🔗 {link}"
     )
 
     await send_telegram(message)
@@ -146,21 +145,18 @@ async def process_listing(link, seen_links):
 
 
 async def run():
-    print("🚗 MULTI SOURCE SNIPER LIVE")
+    print("🚗 PRO SNIPER V3 LIVE")
 
     seen_links = load_seen()
 
     while True:
         try:
-            print("🔎 Scannen alle bronnen...")
+            print("🔎 Scannen bronnen...")
 
-            marktplaats_links = scrape_marktplaats()
-            schadeautos_links = scrape_schadeautos()
+            links = scrape_marktplaats() + scrape_schadeautos()
 
-            all_links = marktplaats_links + schadeautos_links
-
-            for link in all_links:
-                await process_listing(link, seen_links)
+            for link in links:
+                await process_link(link, seen_links)
 
             save_seen(seen_links)
 
