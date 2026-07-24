@@ -12,19 +12,13 @@ CHECK_INTERVAL = 180
 MAX_PRICE = 5000
 MAX_KM = 150000
 
-SEARCH_URL = "https://www.marktplaats.nl/l/auto-s/"
-
-MODELS = [
-    "aygo",
-    "c1",
-    "107",
-    "up",
-    "polo"
-]
+MODELS = ["aygo", "c1", "107", "up", "polo"]
 
 SEEN_FILE = "seen.json"
 
 
+# =========================
+# STORAGE
 # =========================
 
 def load_seen():
@@ -39,6 +33,10 @@ def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
         json.dump(list(seen), f)
 
+
+# =========================
+# FILTER HELPERS
+# =========================
 
 def extract_price(html):
     match = re.search(r'"price":\s*"?(\\d+)"?', html)
@@ -60,8 +58,7 @@ def extract_km(html):
 
 
 def is_target_model(title):
-    title = title.lower()
-    return any(model in title for model in MODELS)
+    return any(model in title.lower() for model in MODELS)
 
 
 async def send_telegram(message):
@@ -69,10 +66,15 @@ async def send_telegram(message):
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
 
-def get_listings():
+# =========================
+# SCRAPERS
+# =========================
+
+def scrape_marktplaats():
+    url = "https://www.marktplaats.nl/l/auto-s/"
     headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(SEARCH_URL, headers=headers)
-    html = response.text
+
+    html = requests.get(url, headers=headers).text
 
     listings = []
     parts = html.split('/v/auto')
@@ -84,58 +86,81 @@ def get_listings():
     return list(set(listings))
 
 
+def scrape_schadeautos():
+    url = "https://www.schadeautos.nl/nl/aanbod"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    html = requests.get(url, headers=headers).text
+
+    links = re.findall(r'href="(/nl/auto/.*?)"', html)
+
+    listings = []
+    for link in links[:20]:
+        listings.append("https://www.schadeautos.nl" + link)
+
+    return list(set(listings))
+
+
 def get_detail(url):
     headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers)
-    return response.text
+    return requests.get(url, headers=headers).text
 
 
 # =========================
+# ENGINE
+# =========================
+
+async def process_listing(link, seen_links):
+
+    if link in seen_links:
+        return
+
+    html = get_detail(link)
+
+    title_match = re.search(r'<title>(.*?)</title>', html)
+    title = title_match.group(1) if title_match else ""
+
+    if not is_target_model(title):
+        return
+
+    price = extract_price(html)
+    km = extract_km(html)
+
+    if price and price > MAX_PRICE:
+        return
+
+    if km and km > MAX_KM:
+        return
+
+    message = (
+        f"🚗 {title}\n"
+        f"💰 €{price}\n"
+        f"📏 {km} km\n"
+        f"🌍 {link}"
+    )
+
+    await send_telegram(message)
+    print("✅ Deal gestuurd:", link)
+
+    seen_links.add(link)
+
 
 async def run():
-    print("🚗 SNIPER LIVE")
+    print("🚗 MULTI SOURCE SNIPER LIVE")
 
     seen_links = load_seen()
 
     while True:
         try:
-            print("🔎 Scannen...")
+            print("🔎 Scannen alle bronnen...")
 
-            listings = get_listings()
+            marktplaats_links = scrape_marktplaats()
+            schadeautos_links = scrape_schadeautos()
 
-            for link in listings:
+            all_links = marktplaats_links + schadeautos_links
 
-                if link in seen_links:
-                    continue
-
-                html = get_detail(link)
-
-                title_match = re.search(r'<title>(.*?)</title>', html)
-                title = title_match.group(1) if title_match else ""
-
-                if not is_target_model(title):
-                    continue
-
-                price = extract_price(html)
-                km = extract_km(html)
-
-                if price and price > MAX_PRICE:
-                    continue
-
-                if km and km > MAX_KM:
-                    continue
-
-                message = (
-                    f"🚗 {title}\n"
-                    f"💰 €{price}\n"
-                    f"📏 {km} km\n"
-                    f"🔗 {link}"
-                )
-
-                await send_telegram(message)
-                print("✅ Deal gestuurd")
-
-                seen_links.add(link)
+            for link in all_links:
+                await process_listing(link, seen_links)
 
             save_seen(seen_links)
 
