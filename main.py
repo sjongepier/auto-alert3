@@ -4,7 +4,6 @@ import requests
 import json
 import re
 from telegram import Bot
-from datetime import datetime
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -12,7 +11,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = 180
 MAX_PRICE = 5000
 MAX_KM = 150000
-MIN_SCORE = 4
 
 SEARCH_URL = "https://www.marktplaats.nl/l/auto-s/"
 
@@ -22,18 +20,6 @@ MODELS = [
     "107",
     "up",
     "polo"
-]
-
-KEYWORDS = [
-    "motor kapot",
-    "loopt niet",
-    "start niet",
-    "distributie",
-    "ketting",
-    "tikken",
-    "rook",
-    "schade",
-    "export"
 ]
 
 SEEN_FILE = "seen.json"
@@ -54,33 +40,23 @@ def save_seen(seen):
         json.dump(list(seen), f)
 
 
-def extract_price(text):
-    match = re.search(r'€\s?([\d\.]+)', text)
+def extract_price(html):
+    match = re.search(r'"price":\s*"?(\\d+)"?', html)
+    if match:
+        return int(match.group(1))
+
+    match = re.search(r'€\s?([\d\.]{4,})', html)
     if match:
         return int(match.group(1).replace(".", ""))
+
     return None
 
 
-def extract_km(text):
-    match = re.search(r'(\d{1,3}\.\d{3})\s?km', text.lower())
+def extract_km(html):
+    match = re.search(r'(\d{1,3}\.\d{3})\s?km', html.lower())
     if match:
         return int(match.group(1).replace(".", ""))
     return None
-
-
-def calculate_score(price, km, description):
-    score = 0
-
-    if price and price < 2500:
-        score += 2
-
-    if km and km < 120000:
-        score += 2
-
-    if any(k in description.lower() for k in KEYWORDS):
-        score += 2
-
-    return score
 
 
 def is_target_model(title):
@@ -117,7 +93,7 @@ def get_detail(url):
 # =========================
 
 async def run():
-    print("🚗 ULTRA SNIPER LIVE")
+    print("🚗 SNIPER LIVE")
 
     seen_links = load_seen()
 
@@ -134,14 +110,14 @@ async def run():
 
                 html = get_detail(link)
 
-                price = extract_price(html)
-                km = extract_km(html)
-
                 title_match = re.search(r'<title>(.*?)</title>', html)
                 title = title_match.group(1) if title_match else ""
 
                 if not is_target_model(title):
                     continue
+
+                price = extract_price(html)
+                km = extract_km(html)
 
                 if price and price > MAX_PRICE:
                     continue
@@ -149,19 +125,15 @@ async def run():
                 if km and km > MAX_KM:
                     continue
 
-                score = calculate_score(price, km, html)
+                message = (
+                    f"🚗 {title}\n"
+                    f"💰 €{price}\n"
+                    f"📏 {km} km\n"
+                    f"🔗 {link}"
+                )
 
-                if score >= MIN_SCORE:
-                    message = (
-                        f"🚗 {title}\n"
-                        f"💰 €{price}\n"
-                        f"📏 {km} km\n"
-                        f"📊 Score: {score}\n"
-                        f"🔗 {link}"
-                    )
-
-                    await send_telegram(message)
-                    print("✅ Deal gestuurd")
+                await send_telegram(message)
+                print("✅ Deal gestuurd")
 
                 seen_links.add(link)
 
