@@ -1,0 +1,23 @@
+{
+  "models": ["aygo", "c1", "107", "picanto", "i10", "yaris"],
+  "motivation_words": [
+    "moet weg",
+    "ivm",
+    "verhuizing", 
+    "spoed",
+    "geen tijd",
+    "overcompleet"
+  ],
+  "dealer_words": [
+    "inruil",
+    "garantie",
+    "btw",
+    "bedrijf",
+    "dealer"
+  ],
+  "buy_limits": [
+    {"min_year": 2013, "base": 2800},
+    {"min_year": 2008, "base": 2400},
+    {"min_year": 0, "base": 2000}
+  ]
+}
