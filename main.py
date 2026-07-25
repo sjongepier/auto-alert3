@@ -29,7 +29,7 @@ async def get_html(url, session):
 
 
 async def get_market_average(session, model):
-    url = "https://www.marktplaats.nl/l/auto-s/q/{}/".format(model)
+    url = "https://www.marktplaats.nl/l/auto-s/q/" + model + "/"
     html = await get_html(url, session)
 
     if not html:
@@ -57,11 +57,10 @@ async def scan_loop(app):
             for model in MODELS:
 
                 market_avg = await get_market_average(session, model)
-
                 if not market_avg:
                     continue
 
-                search_url = "https://www.marktplaats.nl/l/auto-s/q/{}/?sortBy=SORT_INDEX&sortOrder=DECREASING".format(model)
+                search_url = "https://www.marktplaats.nl/l/auto-s/q/" + model + "/?sortBy=SORT_INDEX&sortOrder=DECREASING"
 
                 html = await get_html(search_url, session)
                 if not html:
@@ -91,10 +90,30 @@ async def scan_loop(app):
                         continue
 
                     margin = market_avg - price
-
                     if margin < MIN_MARGIN:
                         continue
 
-                    message = (
-                        "DEAL\n\n"
-                        "Model: " + model + "\n"
+                    message = "DEAL\n"
+                    message += "Model: " + model + "\n"
+                    message += "Titel: " + title + "\n"
+                    message += "Prijs: €" + str(price) + "\n"
+                    message += "Markt: €" + str(int(market_avg)) + "\n"
+                    message += "Winst: €" + str(int(margin)) + "\n"
+                    message += full_link
+
+                    await app.bot.send_message(chat_id=CHAT_ID, text=message)
+
+            await asyncio.sleep(CHECK_INTERVAL)
+
+
+async def post_init(app):
+    asyncio.create_task(scan_loop(app))
+
+
+def main():
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
