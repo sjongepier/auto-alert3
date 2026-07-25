@@ -7,7 +7,7 @@ from telegram.ext import ApplicationBuilder
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-CHECK_INTERVAL = 30
+CHECK_INTERVAL = 20
 
 MODELS = ["aygo", "c1", "107", "picanto", "i10", "yaris"]
 
@@ -30,7 +30,9 @@ DEALER_WORDS = [
 
 MAX_KM = 220000
 
-print("MULTI SOURCE DEALER STARTING...", flush=True)
+seen_links = set()
+
+print("AGRESSIVE SMART MODE STARTING...", flush=True)
 
 
 async def get_html(url, session):
@@ -102,11 +104,15 @@ async def scan_marktplaats(session, app):
             continue
 
         links = re.findall(r'href="(/v/auto[^"]+)"', html)
-        links = list(set(links))[:15]
+        links = list(dict.fromkeys(links))[:12]
 
         for link in links:
 
             full_link = "https://www.marktplaats.nl" + link
+
+            if full_link in seen_links:
+                continue
+
             listing_html = await get_html(full_link, session)
             if not listing_html:
                 continue
@@ -133,12 +139,16 @@ async def scan_marktplaats(session, app):
             if price > buy_limit:
                 continue
 
+            # prijs per km check
+            if km and price / km > 0.035:
+                continue
+
             boost = ""
             if contains_word(listing_html, MOTIVATION_WORDS):
                 boost = " (MOTIVATED SELLER)"
 
             message = (
-                "MARKTPLAATS DEAL" + boost + "\n\n"
+                "AGRESSIVE DEAL" + boost + "\n\n"
                 "Titel: " + title + "\n"
                 "Bouwjaar: " + str(year) + "\n"
                 "KM: " + str(km) + "\n"
@@ -149,6 +159,8 @@ async def scan_marktplaats(session, app):
 
             await app.bot.send_message(chat_id=CHAT_ID, text=message)
 
+            seen_links.add(full_link)
+
 
 async def scan_loop(app):
 
@@ -156,16 +168,13 @@ async def scan_loop(app):
 
     await app.bot.send_message(
         chat_id=CHAT_ID,
-        text="Multi-source dealer actief."
+        text="Agressive smart dealer actief."
     )
 
     async with aiohttp.ClientSession() as session:
         while True:
-
-            print("Nieuwe scan...", flush=True)
-
+            print("Nieuwe agressieve scan...", flush=True)
             await scan_marktplaats(session, app)
-
             await asyncio.sleep(CHECK_INTERVAL)
 
 
