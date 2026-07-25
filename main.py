@@ -3,15 +3,10 @@ import asyncio
 import aiohttp
 import json
 import re
-from datetime import datetime
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ================== CONFIG ==================
+print("🚀 BOT STARTING...", flush=True)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -29,7 +24,7 @@ DEFAULT_CONFIG = {
 
 CHECK_INTERVAL = 180
 
-# ================== STORAGE ==================
+# ================= STORAGE =================
 
 def load_config():
     try:
@@ -56,7 +51,7 @@ def save_seen(seen):
 config = load_config()
 seen_links = load_seen()
 
-# ================== SCRAPING ==================
+# ================= SCRAPING =================
 
 async def get_html(url, session):
     try:
@@ -83,8 +78,7 @@ async def get_market_average(session, model):
     if len(prices) < 5:
         return None
 
-    prices = prices[:20]
-    return sum(prices) / len(prices)
+    return sum(prices[:20]) / len(prices[:20])
 
 async def scrape_model(session, model):
     url = f"https://www.marktplaats.nl/l/auto-s/q/{model}/?sortBy=SORT_INDEX&sortOrder=DECREASING"
@@ -111,9 +105,10 @@ def parse_listing(html):
 
     return title, price
 
-# ================== DEAL ENGINE ==================
+# ================= DEAL LOOP =================
 
 async def deal_loop(application):
+    print("✅ DEAL LOOP STARTED", flush=True)
 
     await application.bot.send_message(
         chat_id=CHAT_ID,
@@ -127,6 +122,8 @@ async def deal_loop(application):
             if not config["active"]:
                 await asyncio.sleep(5)
                 continue
+
+            print("🔎 Nieuwe scan...", flush=True)
 
             market_cache = {}
 
@@ -149,3 +146,60 @@ async def deal_loop(application):
 
                     if not title or not price:
                         continue
+
+                    if price > config["max_price"]:
+                        continue
+
+                    market_avg = market_cache.get(model)
+                    if not market_avg:
+                        continue
+
+                    margin = market_avg - price
+                    percent = margin / market_avg
+
+                    if margin < config["min_margin"]:
+                        continue
+
+                    if percent < config["min_percent"]:
+                        continue
+
+                    tag = "🔥 SNIPER" if margin >= 1000 else "💰 FLIP"
+
+                    message = (
+                        f"{tag}\n\n"
+                        f"🚗 {title}\n"
+                        f"💰 €{price}\n"
+                        f"📈 Markt €{int(market_avg)}\n"
+                        f"💸 Winst €{int(margin)}\n"
+                        f"🔗 {link}"
+                    )
+
+                    await application.bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=message
+                    )
+
+                    seen_links.add(link)
+                    save_seen(seen_links)
+
+            await asyncio.sleep(CHECK_INTERVAL)
+
+# ================= COMMANDS =================
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        f"📊 INSTELLINGEN\n\n"
+        f"Max prijs: €{config['max_price']}\n"
+        f"Min marge: €{config['min_margin']}\n"
+        f"Min %: {int(config['min_percent']*100)}%\n"
+        f"Modellen: {', '.join(config['models'])}\n"
+        f"Status: {'Actief' if config['active'] else 'Gepauzeerd'}"
+    )
+    await update.message.reply_text(msg)
+
+async def margin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        value = int(context.args[0])
+        config["min_margin"] = value
+        save_config(config)
+        await update.message.reply_text(f"✅ 
