@@ -9,16 +9,9 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 CHECK_INTERVAL = 30
 
-BUY_LIMITS = {
-    "aygo": 2500,
-    "c1": 2300,
-    "107": 2300,
-    "picanto": 2200,
-    "i10": 2200,
-    "yaris": 2500
-}
+MODELS = ["aygo", "c1", "107", "picanto", "i10", "yaris"]
 
-print("SNIPER MODE STARTING...", flush=True)
+print("SMART DEALER MODE STARTING...", flush=True)
 
 
 async def get_html(url, session):
@@ -34,20 +27,61 @@ async def get_html(url, session):
         return None
 
 
+def extract_km(text):
+    match = re.search(r'(\d{1,3}\.?\d{3})\s?km', text.lower())
+    if match:
+        return int(match.group(1).replace(".", ""))
+    return None
+
+
+def extract_year(text):
+    match = re.search(r'(20\d{2}|19\d{2})', text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def calculate_buy_limit(model, year, km):
+
+    if not year or not km:
+        return None
+
+    if km > 230000:
+        return None
+
+    base = 0
+
+    # Bouwjaar basis
+    if year >= 2013:
+        base = 2800
+    elif year >= 2008:
+        base = 2400
+    else:
+        base = 2000
+
+    # KM correctie
+    if km < 120000:
+        base += 300
+    elif km > 180000:
+        base -= 400
+
+    return base
+
+
 async def scan_loop(app):
-    print("SNIPER LOOP STARTED", flush=True)
+    print("SMART LOOP STARTED", flush=True)
 
     await app.bot.send_message(
         chat_id=CHAT_ID,
-        text="Sniper mode actief (vaste koopgrenzen)."
+        text="Smart dealer mode actief (bouwjaar + km)."
     )
 
     async with aiohttp.ClientSession() as session:
         while True:
 
-            print("Nieuwe sniper scan...", flush=True)
+            print("Nieuwe smart scan...", flush=True)
 
-            for model, limit in BUY_LIMITS.items():
+            for model in MODELS:
 
                 search_url = (
                     "https://www.marktplaats.nl/l/auto-s/q/"
@@ -78,15 +112,25 @@ async def scan_loop(app):
                     title = title_match.group(1)
                     price = int(price_match.group(1))
 
-                    if price > limit:
+                    km = extract_km(listing_html)
+                    year = extract_year(title)
+
+                    buy_limit = calculate_buy_limit(model, year, km)
+
+                    if not buy_limit:
+                        continue
+
+                    if price > buy_limit:
                         continue
 
                     message = (
-                        "SNIPER DEAL\n\n"
+                        "SMART DEAL\n\n"
                         "Model: " + model + "\n"
                         "Titel: " + title + "\n"
+                        "Bouwjaar: " + str(year) + "\n"
+                        "KM: " + str(km) + "\n"
                         "Vraagprijs: €" + str(price) + "\n"
-                        "Koopgrens: €" + str(limit) + "\n"
+                        "Max koopprijs: €" + str(buy_limit) + "\n"
                         + full_link
                     )
 
