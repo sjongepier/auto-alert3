@@ -7,20 +7,18 @@ from telegram.ext import ApplicationBuilder
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-CHECK_INTERVAL = 60
-MAX_PRICE = 3000
-MIN_MARGIN = 600
+CHECK_INTERVAL = 30
 
-MODELS = [
-    "aygo",
-    "c1",
-    "107",
-    "picanto",
-    "i10",
-    "yaris"
-]
+BUY_LIMITS = {
+    "aygo": 2500,
+    "c1": 2300,
+    "107": 2300,
+    "picanto": 2200,
+    "i10": 2200,
+    "yaris": 2500
+}
 
-print("€3000 PRO DEALER BOT STARTING...", flush=True)
+print("SNIPER MODE STARTING...", flush=True)
 
 
 async def get_html(url, session):
@@ -36,45 +34,25 @@ async def get_html(url, session):
         return None
 
 
-async def get_market_average(session, model):
-    url = "https://www.marktplaats.nl/l/auto-s/q/" + model + "/"
-    html = await get_html(url, session)
-
-    if not html:
-        return None
-
-    prices = re.findall(r'"price":\s*"(\d+)"', html)
-    prices = [int(p) for p in prices if int(p) < 10000]
-
-    if len(prices) < 5:
-        return None
-
-    return sum(prices[:15]) / len(prices[:15])
-
-
 async def scan_loop(app):
-    print("SCAN LOOP STARTED", flush=True)
+    print("SNIPER LOOP STARTED", flush=True)
 
     await app.bot.send_message(
         chat_id=CHAT_ID,
-        text="€3000 Pro Dealer Bot actief (min €600 marge)."
+        text="Sniper mode actief (vaste koopgrenzen)."
     )
 
     async with aiohttp.ClientSession() as session:
         while True:
 
-            print("Nieuwe scan...", flush=True)
+            print("Nieuwe sniper scan...", flush=True)
 
-            for model in MODELS:
-
-                market_avg = await get_market_average(session, model)
-                if not market_avg:
-                    continue
+            for model, limit in BUY_LIMITS.items():
 
                 search_url = (
                     "https://www.marktplaats.nl/l/auto-s/q/"
                     + model +
-                    "/?priceTo=3000&sortBy=SORT_INDEX&sortOrder=DECREASING"
+                    "/?sortBy=SORT_INDEX&sortOrder=DECREASING"
                 )
 
                 html = await get_html(search_url, session)
@@ -82,7 +60,7 @@ async def scan_loop(app):
                     continue
 
                 links = re.findall(r'href="(/v/auto[^"]+)"', html)
-                links = list(set(links))[:6]
+                links = list(set(links))[:15]
 
                 for link in links:
 
@@ -100,20 +78,15 @@ async def scan_loop(app):
                     title = title_match.group(1)
                     price = int(price_match.group(1))
 
-                    if price > MAX_PRICE:
-                        continue
-
-                    margin = market_avg - price
-                    if margin < MIN_MARGIN:
+                    if price > limit:
                         continue
 
                     message = (
-                        "PRO DEAL\n\n"
+                        "SNIPER DEAL\n\n"
                         "Model: " + model + "\n"
                         "Titel: " + title + "\n"
-                        "Prijs: €" + str(price) + "\n"
-                        "Markt: €" + str(int(market_avg)) + "\n"
-                        "Marge: €" + str(int(margin)) + "\n"
+                        "Vraagprijs: €" + str(price) + "\n"
+                        "Koopgrens: €" + str(limit) + "\n"
                         + full_link
                     )
 
