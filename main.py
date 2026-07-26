@@ -1196,4 +1196,78 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    main()# In de imports, voeg toe:
+from telegram.ext import CommandHandler
+
+# Na class TelegramNotifier, voeg toe:
+class BotCommands:
+    """Handler voor bot commands."""
+    
+    def __init__(self, notifier: TelegramNotifier, scraper: ProfitScraper):
+        self.notifier = notifier
+        self.scraper = scraper
+    
+    async def start(self, update, context):
+        """Start command."""
+        welcome = (
+            "🚀 *Welkom bij Auto Profit Bot!*\n\n"
+            "Ik scan 24/7 Marktplaats voor winstgevende auto deals.\n\n"
+            "✅ Alleen deals met €500+ winst\n"
+            "✅ Realtime marktwaarde analyse\n"
+            "✅ Automatische dealer filtering\n\n"
+            "Je ontvangt nu automatisch alerts bij goede deals!\n\n"
+            "Gebruik /help voor meer info."
+        )
+        await update.message.reply_text(welcome, parse_mode='Markdown')
+    
+    async def help(self, update, context):
+        """Help command."""
+        help_text = (
+            "❓ *Hoe werkt de bot?*\n\n"
+            "1️⃣ Ik scan elke 8 seconden Marktplaats\n"
+            "2️⃣ Bij nieuwe auto's check ik de marktwaarde\n"
+            "3️⃣ Als winst >€500: je krijgt een alert!\n\n"
+            "📊 *Deal Categorieën:*\n"
+            "💎 GODLIKE: €1000+ winst\n"
+            "🔥 EXCELLENT: €500-1000 winst\n"
+            "✅ GOOD: €300-500 winst\n\n"
+            "💡 *Tips:*\n"
+            "• Reageer binnen 5 minuten\n"
+            "• Screenshot + direct bellen\n"
+            "• Onderhandel altijd\n\n"
+            "Commands:\n"
+            "/stats - Bekijk statistieken\n"
+            "/help - Deze uitleg"
+        )
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+    
+    async def stats(self, update, context):
+        """Stats command."""
+        stats = self.scraper.get_stats()
+        
+        stats_text = (
+            "📊 *Bot Statistieken*\n\n"
+            f"🔍 Scans: {stats['scans']}\n"
+            f"📋 Listings bekeken: {stats['listings_checked']}\n"
+            f"💰 Deals gevonden: {stats['deals_found']}\n\n"
+            f"⚡ Scan interval: 8 seconden\n"
+            f"🎯 Min. winst: €500\n"
+        )
+        await update.message.reply_text(stats_text, parse_mode='Markdown')
+
+# In ProfitBot class, update _post_init:
+async def _post_init(self, app):
+    self.notifier = TelegramNotifier(app, self.bot_config.telegram_chat_id)
+    self.scraper = ProfitScraper(
+        self.bot_config,
+        self.filter_config,
+        self.seen_manager,
+    )
+    
+    # Voeg command handlers toe
+    commands = BotCommands(self.notifier, self.scraper)
+    app.add_handler(CommandHandler("start", commands.start))
+    app.add_handler(CommandHandler("help", commands.help))
+    app.add_handler(CommandHandler("stats", commands.stats))
+    
+    asyncio.create_task(self._scan_loop())
