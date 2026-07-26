@@ -463,7 +463,7 @@ class MarketAnalysis:
         is_estimated: bool = False,
     ) -> 'MarketAnalysis':
 
-        if not market_value:
+        if not market_value or market_value <= 0:
             return cls(
                 asking_price=asking_price,
                 market_value=None,
@@ -473,16 +473,20 @@ class MarketAnalysis:
                 is_estimated=is_estimated,
             )
 
-        if asking_price < 2000:
-            cost_factor = 0.95
+        if asking_price < 1000:
+            cost_factor = 0.97
+        elif asking_price < 2000:
+            cost_factor = 0.94
         elif asking_price < 5000:
-            cost_factor = 0.92
+            cost_factor = 0.90
         else:
-            cost_factor = 0.88
+            cost_factor = 0.85
 
         sell_price = market_value * cost_factor
         profit = int(sell_price - asking_price)
         profit_pct = (profit / asking_price * 100) if asking_price > 0 else 0
+
+        logger.info(f"   💰 Winst: €{profit} (markt: €{market_value:.0f}, cost: {(1-cost_factor)*100:.0f}%)")
 
         return cls(
             asking_price=asking_price,
@@ -626,62 +630,61 @@ class Listing:
 
         await self._try_rdw_check(rdw_client, client)
 
-        if self.year and self.km and self.brand and self.model:
-            
-            if self.km > settings.max_km:
-                self.deal_quality = DealQuality.POOR
-                return
+        # ✅ ONLY PROCESS IF WE HAVE COMPLETE DATA
+        if not (self.year and self.km and self.brand and self.model):
+            logger.info(f"   ⚠️ Incomplete data - skipping")
+            self.deal_quality = DealQuality.POOR
+            return
+        
+        if self.km > settings.max_km:
+            self.deal_quality = DealQuality.POOR
+            return
 
-            price_per_km = self.price / self.km
-            if price_per_km > settings.price_per_km_limit:
-                self.deal_quality = DealQuality.POOR
-                return
+        price_per_km = self.price / self.km
+        if price_per_km > settings.price_per_km_limit:
+            self.deal_quality = DealQuality.POOR
+            return
 
-            search_term = self.search_term or (self.model.lower() if self.model else "")
+        search_term = self.search_term or (self.model.lower() if self.model else "")
 
-            market_value, is_estimated = await market_calculator.get_market_value(
-                search_term, self.year, self.km, self.url, client
-            )
+        market_value, is_estimated = await market_calculator.get_market_value(
+            search_term, self.year, self.km, self.url, client
+        )
 
-            adjusted_min_profit = settings.min_profit_margin
-            if self.is_urgent:
-                adjusted_min_profit = int(settings.min_profit_margin * 0.5)
+        # ✅ MUST HAVE MARKET VALUE
+        if not market_value:
+            logger.info(f"   ❌ No market value - skipping")
+            self.deal_quality = DealQuality.POOR
+            return
 
-            self.market_analysis = MarketAnalysis.analyze(
-                self.price, market_value, adjusted_min_profit, is_estimated,
-            )
+        adjusted_min_profit = settings.min_profit_margin
+        if self.is_urgent:
+            adjusted_min_profit = int(settings.min_profit_margin * 0.5)
 
-            if not self.market_analysis.is_profitable:
-                profit = self.market_analysis.profit_potential or 0
-                if profit > 0:
-                    self.deal_quality = DealQuality.WATCHLIST
-                    return
-                self.deal_quality = DealQuality.POOR
-                return
+        self.market_analysis = MarketAnalysis.analyze(
+            self.price, market_value, adjusted_min_profit, is_estimated,
+        )
 
+        if not self.market_analysis.is_profitable:
             profit = self.market_analysis.profit_potential or 0
+            if profit > 50:
+                self.deal_quality = DealQuality.WATCHLIST
+                return
+            self.deal_quality = DealQuality.POOR
+            return
 
-            if profit >= 1500:
-                self.deal_quality = DealQuality.GODLIKE
-            elif profit >= 800:
-                self.deal_quality = DealQuality.EXCELLENT
-            elif profit >= 400:
-                self.deal_quality = DealQuality.GOOD
-            else:
-                self.deal_quality = DealQuality.AVERAGE
-                
+        profit = self.market_analysis.profit_potential or 0
+
+        if profit >= 1500:
+            self.deal_quality = DealQuality.GODLIKE
+        elif profit >= 800:
+            self.deal_quality = DealQuality.EXCELLENT
+        elif profit >= 400:
+            self.deal_quality = DealQuality.GOOD
+        elif profit >= 150:
+            self.deal_quality = DealQuality.AVERAGE
         else:
-            if self.price < 1500:
-                self.deal_quality = DealQuality.WATCHLIST
-                return
-            
-            if self.km and self.price / self.km < 0.12:
-                self.deal_quality = DealQuality.WATCHLIST
-                return
-            
-            if self.motivated_seller and self.price < 3000:
-                self.deal_quality = DealQuality.WATCHLIST
-                return
+            self.deal_quality = DealQuality.WATCHLIST
 
     @property
     def is_good_deal(self) -> bool:
@@ -730,11 +733,11 @@ class Listing:
                 estimate_note = "\n⚠️ (Schatting)"
 
             if self.price < 2000:
-                cost_pct = 5
+                cost_pct = 3
             elif self.price < 5000:
-                cost_pct = 8
+                cost_pct = 6
             else:
-                cost_pct = 12
+                cost_pct = 10
 
             market_info = (
                 f"\n\n💰 WINST:\n"
@@ -1239,6 +1242,7 @@ class ProfitScraper:
             f"   🚨 {self._stats['urgent_deals']} urgent\n"
             f"   👀 {self._stats['watchlist_deals']} watchlist"
         )
+        logger.info(f"   Stats: {self._stats}")
         logger.info(f"{'='*60}\n")
 
         self.price_tracker.cleanup_old()
@@ -1466,13 +1470,15 @@ class ProfitBot:
                         if deals:
                             logger.info(f"📤 Sturen naar Telegram...")
                             for i, deal in enumerate(deals, 1):
-                                logger.info(f"   [{i}/{len(deals)}] {deal.title[:30]}...")
+                                logger.info(f"   [{i}/{len(deals)}] {deal.title[:30]}... (€{deal.market_analysis.profit_potential if deal.market_analysis else 'N/A'} winst)")
                                 sent = await self.notifier.send_listing(deal)
                                 if sent:
                                     logger.info(f"   ✅ Verzonden!")
                                 else:
                                     logger.error(f"   ❌ Verzenden mislukt!")
                                 await asyncio.sleep(1)
+                        else:
+                            logger.warning(f"⚠️ GEEN DEALS DEZE SCAN!")
 
                         await self.seen_manager.cleanup_and_save()
 
