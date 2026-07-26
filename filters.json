@@ -1,0 +1,18 @@
+{
+  "models": ["aygo", "yaris", "c1", "107", "picanto", "i10", "up", "mii", "citigo"],
+  "model_aliases": {
+    "aygo": ["toyota aygo", "aygo x"],
+    "yaris": ["toyota yaris", "yaris hybrid"],
+    "c1": ["citroen c1"],
+    "107": ["peugeot 107"],
+    "picanto": ["kia picanto"],
+    "i10": ["hyundai i10"],
+    "up": ["volkswagen up", "vw up"],
+    "mii": ["seat mii"],
+    "citigo": ["skoda citigo"]
+  },
+  "motivation_words": ["..."],
+  "dealer_words": ["..."],
+  "red_flags": ["..."],
+  "quality_indicators": ["..."]
+}
