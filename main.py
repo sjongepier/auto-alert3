@@ -17,6 +17,7 @@ from enum import Enum
 from zoneinfo import ZoneInfo
 from telegram.ext import ApplicationBuilder, CommandHandler
 import sys
+from collections import Counter
 
 # ---------------------------------------------------------
 # CONSTANTS & ENUMS
@@ -27,10 +28,11 @@ class DealQuality(Enum):
     EXCELLENT = "EXCELLENT"
     GOOD = "GOOD"
     AVERAGE = "AVERAGE"
+    WATCHLIST = "WATCHLIST"  # NIEUW: bijna goede deal
     POOR = "POOR"
 
 PRICE_CENT_THRESHOLD = 100_000
-MIN_COMPARISON_SAMPLES = 3
+MIN_COMPARISON_SAMPLES = 1  # VERLAAGD van 3 naar 1
 
 KENTEKEN_PATTERN = re.compile(r'\b([A-Za-z0-9]{1,3}-[A-Za-z0-9]{1,3}-[A-Za-z0-9]{1,3})\b')
 
@@ -45,14 +47,14 @@ class BotConfig:
     """Opstart-configuratie, geladen uit env vars. Onveranderlijk tijdens runtime."""
     telegram_token: str
     telegram_chat_id: str
-    check_interval: int = 20
+    check_interval: int = 15  # VERLAAGD van 20 naar 15
     max_concurrent_requests: int = 5
     request_timeout: int = 15
     max_retries: int = 3
 
     min_profit_margin: int = 500
     max_km: int = 220_000
-    price_per_km_limit: float = 0.15  # sanity-check, geen hoofdfilter
+    price_per_km_limit: float = 0.15
     seen_max_age_days: int = 30
 
     market_value_samples: int = 50
@@ -71,7 +73,7 @@ class BotConfig:
         return cls(
             telegram_token=token,
             telegram_chat_id=chat_id,
-            check_interval=int(os.getenv("CHECK_INTERVAL", 20)),
+            check_interval=int(os.getenv("CHECK_INTERVAL", 15)),
             min_profit_margin=int(os.getenv("MIN_PROFIT_MARGIN", 500)),
             max_km=int(os.getenv("MAX_KM", 220_000)),
             price_per_km_limit=float(os.getenv("PRICE_PER_KM_LIMIT", 0.15)),
@@ -82,11 +84,7 @@ class BotConfig:
 
 @dataclass
 class RuntimeSettings:
-    """
-    Aanpasbare instellingen tijdens het draaien van de bot.
-    Wordt bij elke wijziging opgeslagen zodat /pause en /settings
-    een herstart overleven.
-    """
+    """Aanpasbare instellingen tijdens het draaien van de bot."""
     min_profit_margin: int
     max_km: int
     price_per_km_limit: float
@@ -137,6 +135,7 @@ class FilterConfig:
     dealer_words: List[str]
     red_flags: List[str]
     quality_indicators: List[str]
+    model_aliases: Dict[str, List[str]] = field(default_factory=dict)  # NIEUW
 
     @classmethod
     def from_file(cls, path: Path) -> 'FilterConfig':
@@ -144,7 +143,14 @@ class FilterConfig:
             raise FileNotFoundError(f"filters.json niet gevonden")
 
         data = json.loads(path.read_text())
-        return cls(**data)
+        return cls(
+            models=data.get("models", []),
+            motivation_words=data.get("motivation_words", []),
+            dealer_words=data.get("dealer_words", []),
+            red_flags=data.get("red_flags", []),
+            quality_indicators=data.get("quality_indicators", []),
+            model_aliases=data.get("model_aliases", {}),  # NIEUW
+        )
 
 # ---------------------------------------------------------
 # LOGGING
@@ -165,11 +171,9 @@ class ColoredFormatter(logging.Formatter):
         try:
             self.timezone = ZoneInfo(timezone)
         except:
-            # Fallback als zoneinfo niet beschikbaar is
             self.timezone = None
     
     def formatTime(self, record, datefmt=None):
-        """Override om lokale tijd te gebruiken ipv UTC"""
         if self.timezone:
             dt = datetime.fromtimestamp(record.created, tz=self.timezone)
         else:
@@ -294,6 +298,46 @@ class RDWClient:
 
 
 # ---------------------------------------------------------
+# PRICE HISTORY TRACKER (NIEUW)
+# ---------------------------------------------------------
+
+class PriceHistoryTracker:
+    """Track prijsveranderingen van listings"""
+    
+    def __init__(self):
+        self._history: Dict[str, List[Tuple[datetime, int]]] = {}
+    
+    def track(self, url: str, price: int):
+        if url not in self._history:
+            self._history[url] = []
+        self._history[url].append((datetime.now(), price))
+        
+        # Hou maximaal 10 entries per URL
+        if len(self._history[url]) > 10:
+            self._history[url] = self._history[url][-10:]
+    
+    def price_dropped(self, url: str, current_price: int) -> Optional[int]:
+        """Return hoeveel prijs gedaald is, of None"""
+        if url not in self._history or len(self._history[url]) < 2:
+            return None
+        
+        previous_price = self._history[url][-2][1]
+        drop = previous_price - current_price
+        return drop if drop > 0 else None
+    
+    def cleanup_old(self, days: int = 7):
+        """Verwijder entries ouder dan X dagen"""
+        cutoff = datetime.now() - timedelta(days=days)
+        for url in list(self._history.keys()):
+            self._history[url] = [
+                (ts, price) for ts, price in self._history[url]
+                if ts > cutoff
+            ]
+            if not self._history[url]:
+                del self._history[url]
+
+
+# ---------------------------------------------------------
 # MARKET VALUE CALCULATOR
 # ---------------------------------------------------------
 
@@ -306,12 +350,6 @@ class MarketValueCalculator:
 
     @staticmethod
     def _extract_all_text(item: dict) -> str:
-        """
-        Verzamelt tekst uit meerdere velden van een advertentie
-        (titel, beschrijving, eventuele attributen) zodat jaar/km
-        niet alleen uit de titel gehaald hoeft te worden — die
-        bevat dat vaak niet.
-        """
         parts = [str(item.get('title', '')), str(item.get('description', ''))]
 
         for attr_key in ('attributes', 'specificAttributes', 'specifics'):
@@ -397,20 +435,15 @@ class MarketValueCalculator:
         exclude_url: str,
         client: 'SmartClient',
     ) -> Tuple[Optional[float], bool]:
-        """
-        Retourneert (marktwaarde, is_geschat).
-        is_geschat=True betekent: geen directe matches gevonden,
-        waarde is een ruwe schatting o.b.v. de hele steekproef.
-        """
-
         raw_pool = await self._get_pool(search_term, client)
         pool = [p for p in raw_pool if p['url'] != exclude_url]
 
         if not pool:
             return None, False
 
-        # Progressief breder vergelijken
-        tolerances = [(1, 30_000), (2, 60_000), (3, 100_000)]
+        # VERSOEPELDE tolerances - breder zoeken
+        tolerances = [(2, 50_000), (3, 80_000), (5, 120_000)]  # Was: [(1, 30_000), (2, 60_000), (3, 100_000)]
+        
         for year_tol, km_tol in tolerances:
             matches = [
                 p['price'] for p in pool
@@ -426,11 +459,11 @@ class MarketValueCalculator:
                 )
                 return value, False
 
-        # Fallback: ruwe schatting o.b.v. hele pool + jaar-correctie
+        # Fallback: ruwe schatting
         priced = [p for p in pool if p['price'] is not None]
         if len(priced) < MIN_COMPARISON_SAMPLES:
             logger.warning(
-                f"⚠️  Te weinig data ({len(priced)}) voor {search_term} {year}, ook voor schatting"
+                f"⚠️  Te weinig data ({len(priced)}) voor {search_term} {year}"
             )
             return None, False
 
@@ -447,8 +480,8 @@ class MarketValueCalculator:
             estimate = base_median
 
         logger.info(
-            f"💰 Marktwaarde {search_term} {year} (RUWE SCHATTING): €{estimate:.0f} "
-            f"(basis: {len(priced)} advertenties, geen directe match)"
+            f"💰 Marktwaarde {search_term} {year} (SCHATTING): €{estimate:.0f} "
+            f"(basis: {len(priced)} advertenties)"
         )
 
         return estimate, True
@@ -485,7 +518,15 @@ class MarketAnalysis:
                 is_estimated=is_estimated,
             )
 
-        sell_price = market_value * 0.90
+        # DYNAMISCHE KOSTEN - realistischer
+        if asking_price < 2000:
+            cost_factor = 0.95  # €100 kosten
+        elif asking_price < 5000:
+            cost_factor = 0.92  # €400 kosten
+        else:
+            cost_factor = 0.90  # €1000+ kosten
+
+        sell_price = market_value * cost_factor
         profit = int(sell_price - asking_price)
         profit_pct = (profit / asking_price * 100) if asking_price > 0 else 0
 
@@ -521,6 +562,9 @@ class Listing:
 
     kenteken: Optional[str] = field(default=None, init=False, repr=False)
     rdw_verified: bool = field(default=False, init=False, repr=False)
+    
+    is_urgent: bool = field(default=False, init=False, repr=False)  # NIEUW
+    price_drop: Optional[int] = field(default=None, init=False, repr=False)  # NIEUW
 
     def __post_init__(self):
         if self.price < 0:
@@ -561,6 +605,24 @@ class Listing:
             if len(words) > 1:
                 self.model = words[1]
 
+    def detect_urgency(self) -> bool:
+        """NIEUW: Detecteer urgente verkoop signalen"""
+        urgency_signals = [
+            r'snel\s+weg',
+            r'deze\s+week',
+            r'vandaag\s+nog',
+            r'moet\s+weg',
+            r'emigratie',
+            r'inruil',
+            r'ruimte\s+nodig',
+            r'heden',
+            r'spoedverkoop',
+            r'direct\s+op',
+            r'vanavond',
+        ]
+        text = f"{self.title} {self.description}".lower()
+        return any(re.search(signal, text) for signal in urgency_signals)
+
     async def _try_rdw_check(self, rdw_client: RDWClient, client: 'SmartClient') -> None:
         kenteken = extract_kenteken(f"{self.title} {self.description}")
         if not kenteken:
@@ -599,9 +661,15 @@ class Listing:
 
         combined_text = f"{self.title} {self.description}".lower()
 
-        self.is_dealer = any(word in combined_text for word in filter_config.dealer_words)
+        # VERBETERDE dealer detectie - moet 2+ matches hebben
+        dealer_count = sum(1 for word in filter_config.dealer_words if word in combined_text)
+        self.is_dealer = dealer_count >= 2
+        
         self.motivated_seller = any(word in combined_text for word in filter_config.motivation_words)
         self.has_red_flags = any(flag in combined_text for flag in filter_config.red_flags)
+        
+        # NIEUW: urgentie detectie
+        self.is_urgent = self.detect_urgency()
 
         self.quality_score = sum(
             1 for indicator in filter_config.quality_indicators
@@ -614,55 +682,89 @@ class Listing:
 
         await self._try_rdw_check(rdw_client, client)
 
-        if not self.year or not self.km or not self.brand or not self.model:
-            self.deal_quality = DealQuality.POOR
-            return
+        # VERSOEPELD: ook zonder jaar/km doorsturen als prijs extreem laag is
+        if self.year and self.km and self.brand and self.model:
+            # Volledige analyse mogelijk
+            
+            if self.km > settings.max_km:
+                self.deal_quality = DealQuality.POOR
+                return
 
-        if self.km > settings.max_km:
-            self.deal_quality = DealQuality.POOR
-            return
+            if self.price / self.km > settings.price_per_km_limit:
+                self.deal_quality = DealQuality.POOR
+                return
 
-        if self.price / self.km > settings.price_per_km_limit:
-            self.deal_quality = DealQuality.POOR
-            return
+            search_term = self.search_term or (self.model.lower() if self.model else "")
 
-        search_term = self.search_term or (self.model.lower() if self.model else "")
+            market_value, is_estimated = await market_calculator.get_market_value(
+                search_term,
+                self.year,
+                self.km,
+                self.url,
+                client
+            )
 
-        market_value, is_estimated = await market_calculator.get_market_value(
-            search_term,
-            self.year,
-            self.km,
-            self.url,
-            client
-        )
+            # AANGEPASTE winstdrempel bij urgentie
+            adjusted_min_profit = settings.min_profit_margin
+            if self.is_urgent:
+                adjusted_min_profit = int(settings.min_profit_margin * 0.7)
+                logger.info(f"🚨 Urgentie: verlaagde drempel naar €{adjusted_min_profit}")
 
-        self.market_analysis = MarketAnalysis.analyze(
-            self.price,
-            market_value,
-            settings.min_profit_margin,
-            is_estimated,
-        )
+            self.market_analysis = MarketAnalysis.analyze(
+                self.price,
+                market_value,
+                adjusted_min_profit,
+                is_estimated,
+            )
 
-        if not self.market_analysis.is_profitable:
-            self.deal_quality = DealQuality.POOR
-            return
+            if not self.market_analysis.is_profitable:
+                # Check of het "bijna" is
+                profit = self.market_analysis.profit_potential or 0
+                shortage = adjusted_min_profit - profit
+                
+                if 0 <= shortage <= 200:  # Binnen €200
+                    self.deal_quality = DealQuality.WATCHLIST
+                    logger.info(f"👀 Bijna-deal: €{shortage} onder drempel")
+                    return
+                
+                self.deal_quality = DealQuality.POOR
+                return
 
-        profit = self.market_analysis.profit_potential or 0
+            profit = self.market_analysis.profit_potential or 0
 
-        if profit >= 1000:
-            self.deal_quality = DealQuality.GODLIKE
-        elif profit >= 500:
-            self.deal_quality = DealQuality.EXCELLENT
-        elif profit >= 300:
-            self.deal_quality = DealQuality.GOOD
-        elif profit >= 150:
-            self.deal_quality = DealQuality.AVERAGE
+            if profit >= 1500:
+                self.deal_quality = DealQuality.GODLIKE
+            elif profit >= 800:
+                self.deal_quality = DealQuality.EXCELLENT
+            elif profit >= 400:
+                self.deal_quality = DealQuality.GOOD
+            elif profit >= 150:
+                self.deal_quality = DealQuality.AVERAGE
+            else:
+                self.deal_quality = DealQuality.POOR
+                
         else:
-            self.deal_quality = DealQuality.POOR
+            # NIEUW: incomplete data, maar check of het potentieel interessant is
+            if self.km and self.price / self.km < 0.05:
+                # Extreem lage prijs per km
+                self.deal_quality = DealQuality.AVERAGE
+                logger.info(f"🔔 Potentiële deal (incomplete): €{self.price} / {self.km}km = €{self.price/self.km:.2f}/km")
+            elif self.price < 1000 and not self.is_dealer:
+                # Extreem lage totaalprijs
+                self.deal_quality = DealQuality.AVERAGE
+                logger.info(f"🔔 Potentiële deal (laag geprijsd): €{self.price}")
+            else:
+                self.deal_quality = DealQuality.POOR
 
     @property
     def is_good_deal(self) -> bool:
-        return self.deal_quality in (DealQuality.GODLIKE, DealQuality.EXCELLENT, DealQuality.GOOD)
+        return self.deal_quality in (
+            DealQuality.GODLIKE, 
+            DealQuality.EXCELLENT, 
+            DealQuality.GOOD,
+            DealQuality.AVERAGE,
+            DealQuality.WATCHLIST
+        )
 
     def format_message(self) -> str:
         quality_emoji = {
@@ -670,14 +772,20 @@ class Listing:
             DealQuality.EXCELLENT: "🔥🔥",
             DealQuality.GOOD: "🔥",
             DealQuality.AVERAGE: "✅",
+            DealQuality.WATCHLIST: "👀",
             DealQuality.POOR: "❌",
         }
 
         emoji = quality_emoji[self.deal_quality]
 
         urgency = ""
-        if self.motivated_seller:
+        if self.is_urgent:
+            urgency = "\n🚨 URGENTE VERKOOP - DIRECT ACTIE!"
+        elif self.motivated_seller:
             urgency = "\n🚨 GEMOTIVEERDE VERKOPER!"
+        
+        if self.price_drop:
+            urgency += f"\n💸 PRIJS GEDAALD met €{self.price_drop}!"
 
         rdw_badge = "\n🪪 RDW geverifieerd ✅" if self.rdw_verified else ""
 
@@ -692,20 +800,34 @@ class Listing:
 
             estimate_note = ""
             if self.market_analysis.is_estimated:
-                estimate_note = "\n⚠️ Ruwe schatting (weinig directe vergelijkingen)"
+                estimate_note = "\n⚠️ Schatting (weinig vergelijkingen)"
+
+            # Bereken dynamische kosten voor weergave
+            if self.price < 2000:
+                cost_pct = 5
+            elif self.price < 5000:
+                cost_pct = 8
+            else:
+                cost_pct = 10
 
             market_info = (
-                f"\n\n💰 WINST ANALYSE (o.b.v. vergelijkbare MP-advertenties):\n"
+                f"\n\n💰 WINST ANALYSE:\n"
                 f"├─ Vraagprijs: €{self.price:,}\n"
                 f"├─ Marktwaarde: €{market_val:,.0f}\n"
-                f"├─ Verkoopprijs*: €{market_val * 0.9:,.0f}\n"
+                f"├─ Verkoopprijs*: €{market_val * (1 - cost_pct/100):,.0f}\n"
                 f"└─ Winst: €{profit:,} ({profit_pct:.0f}%)"
                 f"{estimate_note}\n"
-                f"\n*Na 10% kosten (reparatie/APK/verkoop)"
+                f"\n*Na {cost_pct}% kosten"
             )
+        elif self.deal_quality in (DealQuality.AVERAGE, DealQuality.WATCHLIST):
+            # Geen marktanalyse, maar wel interessant
+            market_info = "\n\n💡 LET OP: Incomplete data, handmatige check nodig!"
+            if self.km:
+                market_info += f"\n📊 Prijs/km: €{self.price/self.km:.2f}"
 
         time_posted = self.timestamp.strftime("%H:%M:%S")
         km_str = f"{self.km:,}" if self.km else "onbekend"
+        year_str = str(self.year) if self.year else "onbekend"
 
         return (
             f"{emoji} {self.deal_quality.value} DEAL!\n"
@@ -713,7 +835,7 @@ class Listing:
             f"🚗 {self.title}\n"
             f"\n📊 SPECIFICATIES:\n"
             f"├─ Merk: {self.brand or '?'} {self.model or ''}\n"
-            f"├─ Bouwjaar: {self.year}\n"
+            f"├─ Bouwjaar: {year_str}\n"
             f"├─ KM-stand: {km_str}\n"
             f"└─ Gevonden: {time_posted}"
             f"{rdw_badge}"
@@ -723,7 +845,7 @@ class Listing:
             f"{'━' * 30}\n"
             f"🔗 {self.url}\n\n"
             f"⚡ ACTIE: Screenshot + Direct Bellen!\n"
-            f"💡 TIP: Bied €{self.price - 200:,} (onderhandelen)"
+            f"💡 TIP: Bied €{max(self.price - 200, int(self.price * 0.9)):,}"
         )
 
 # ---------------------------------------------------------
@@ -964,7 +1086,7 @@ class ListingParser:
                 raw = re.sub(r'[.,\s]', '', match.group(1))
                 try:
                     km = int(raw)
-                    if 1000 < km < 500_000:
+                    if 100 < km < 500_000:  # VERLAAGD van 1000 naar 100
                         return km
                 except ValueError:
                     continue
@@ -975,11 +1097,17 @@ class ListingParser:
     def extract_year(text: str) -> Optional[int]:
         current_year = datetime.now().year
 
+        # UITGEBREIDE PATRONEN
         specific_patterns = [
             r'bouwjaar[:\s]+(\d{4})',
             r'jaar[:\s]+(\d{4})',
-            r'(\d{4})\s+model',
-            r'bj[:\s]+(\d{4})',
+            r'(\d{4})[- ]model',
+            r'bj\.?\s*(\d{4})',
+            r'van\s+(\d{4})',
+            r'uit\s+(\d{4})',
+            r'kenteken\s+(\d{4})',
+            r'(\d{4})\s*-\s*heden',
+            r'(\d{4})\s*-\s*nu',
         ]
 
         for pattern in specific_patterns:
@@ -997,7 +1125,6 @@ class ListingParser:
         if all_years:
             valid = [int(y) for y in all_years if 1990 <= int(y) <= current_year]
             if valid:
-                from collections import Counter
                 counts = Counter(valid)
                 return counts.most_common(1)[0][0]
 
@@ -1023,7 +1150,7 @@ class MarktplaatsRSSMonitor:
     async def check_rss(self, model: str, client: SmartClient) -> List[str]:
         rss_url = (
             f"https://www.marktplaats.nl/lrp/api/search?"
-            f"query={model}&searchInTitleAndDescription=true&limit=25"
+            f"query={model}&searchInTitleAndDescription=true&limit=50"  # VERHOOGD van 25 naar 50
         )
 
         data = await client.get_html(rss_url)
@@ -1077,11 +1204,14 @@ class ProfitScraper:
         )
         self.rdw_client = RDWClient()
         self.rss_monitor = MarktplaatsRSSMonitor(filter_config)
+        self.price_tracker = PriceHistoryTracker()  # NIEUW
 
         self._stats = {
             'scans': 0,
             'listings_checked': 0,
             'deals_found': 0,
+            'urgent_deals': 0,  # NIEUW
+            'watchlist_deals': 0,  # NIEUW
         }
 
         self.found_deals: List[Listing] = []
@@ -1106,11 +1236,17 @@ class ProfitScraper:
             await self.seen_manager.add(url)
             return None
 
+        # NIEUW: track prijsverandering
+        price_drop = self.price_tracker.price_dropped(url, price)
+        self.price_tracker.track(url, price)
+
         km = ListingParser.extract_km(f"{title} {description}")
         if km is None:
             km = ListingParser.extract_km(html)
 
         year = ListingParser.extract_year(f"{title} {description}")
+        if year is None:
+            year = ListingParser.extract_year(html)
 
         try:
             listing = Listing(
@@ -1123,6 +1259,8 @@ class ProfitScraper:
                 year=year,
                 description=description,
             )
+            
+            listing.price_drop = price_drop
 
             await listing.analyze(
                 self.filter_config,
@@ -1144,6 +1282,13 @@ class ProfitScraper:
             return None
 
         self._stats['deals_found'] += 1
+        
+        if listing.is_urgent:
+            self._stats['urgent_deals'] += 1
+        
+        if listing.deal_quality == DealQuality.WATCHLIST:
+            self._stats['watchlist_deals'] += 1
+        
         await self.seen_manager.add(url)
 
         self.found_deals.append(listing)
@@ -1179,18 +1324,30 @@ class ProfitScraper:
 
         self._stats['scans'] += 1
 
+        # NIEUW: gebruik ook aliases
+        all_search_terms = []
+        for model in self.filter_config.models:
+            all_search_terms.append(model)
+            # Voeg aliases toe indien aanwezig
+            aliases = self.filter_config.model_aliases.get(model, [])
+            all_search_terms.extend(aliases)
+
         tasks = [
-            self.scan_model(model, client)
-            for model in self.filter_config.models
+            self.scan_model(term, client)
+            for term in all_search_terms
         ]
 
         results = await asyncio.gather(*tasks)
         all_deals = [deal for model_deals in results for deal in model_deals]
 
         logger.info(
-            f"✅ Scan compleet: {len(all_deals)} profit deals uit "
-            f"{self._stats['listings_checked']} listings"
+            f"✅ Scan compleet: {len(all_deals)} deals uit "
+            f"{self._stats['listings_checked']} listings "
+            f"(waarvan {self._stats['urgent_deals']} urgent)"
         )
+
+        # Cleanup price tracker
+        self.price_tracker.cleanup_old()
 
         return all_deals
 
@@ -1235,10 +1392,16 @@ class TelegramNotifier:
 
     async def send_startup(self, min_profit: int) -> bool:
         message = (
-            "💰 PROFIT BOT ACTIEF\n\n"
+            "💰 PROFIT BOT ACTIEF (v2.0)\n\n"
             f"📅 {datetime.now(ZoneInfo('Europe/Amsterdam')).strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"🎯 Min. winst: €{min_profit}\n"
-            "✅ Monitoring gestart"
+            "✅ Monitoring gestart\n\n"
+            "🆕 NIEUWE FEATURES:\n"
+            "• Urgentie detectie\n"
+            "• Prijsdaling tracking\n"
+            "• Betere jaar/km extractie\n"
+            "• Watchlist deals\n"
+            "• Dynamische kostenberekening"
         )
         return await self.send_message(message)
 
@@ -1247,7 +1410,7 @@ class TelegramNotifier:
 # ---------------------------------------------------------
 
 class BotCommands:
-    """Handler voor bot commands. Alleen de eigenaar (TELEGRAM_CHAT_ID) mag deze gebruiken."""
+    """Handler voor bot commands."""
 
     def __init__(
         self,
@@ -1269,12 +1432,13 @@ class BotCommands:
             return
 
         welcome = (
-            "🚀 *Welkom bij Auto Profit Bot!*\n\n"
+            "🚀 *Welkom bij Auto Profit Bot v2.0!*\n\n"
             "Ik scan 24/7 Marktplaats voor winstgevende auto deals.\n\n"
-            "✅ Alleen deals boven je winstdrempel\n"
-            "✅ Marktwaarde analyse o.b.v. vergelijkbare advertenties\n"
-            "✅ Automatische dealer filtering\n\n"
-            "Je ontvangt nu automatisch alerts bij goede deals!\n\n"
+            "✅ Marktwaarde analyse\n"
+            "✅ Urgentie detectie 🚨\n"
+            "✅ Prijsdaling tracking 💸\n"
+            "✅ Dealer filtering\n\n"
+            "Je ontvangt automatisch alerts!\n\n"
             "Gebruik /help voor meer info."
         )
         await update.message.reply_text(welcome, parse_mode='Markdown')
@@ -1286,23 +1450,23 @@ class BotCommands:
         help_text = (
             "❓ *Hoe werkt de bot?*\n\n"
             "1️⃣ Ik scan regelmatig Marktplaats\n"
-            "2️⃣ Bij nieuwe auto's vergelijk ik met soortgelijke advertenties\n"
-            "3️⃣ Als winst boven de drempel zit: je krijgt een alert!\n\n"
+            "2️⃣ Vergelijk met soortgelijke advertenties\n"
+            "3️⃣ Detecteer urgentie & prijsdalingen\n"
+            "4️⃣ Stuur alleen goede deals door!\n\n"
             "📊 *Deal Categorieën:*\n"
-            "💎 GODLIKE: €1000+ winst\n"
-            "🔥 EXCELLENT: €500-1000 winst\n"
-            "✅ GOOD: €300-500 winst\n\n"
-            "💡 *Tips:*\n"
-            "• Reageer binnen 5 minuten\n"
-            "• Screenshot + direct bellen\n"
-            "• Onderhandel altijd\n\n"
+            "💎 GODLIKE: €1500+ winst\n"
+            "🔥🔥 EXCELLENT: €800-1500 winst\n"
+            "🔥 GOOD: €400-800 winst\n"
+            "✅ AVERAGE: €150-400 winst\n"
+            "👀 WATCHLIST: Bijna-deals\n\n"
+            "🚨 *Urgentie:* Verlaagde winstdrempel\n"
+            "💸 *Prijsdaling:* Direct doorgestuurd\n\n"
             "*Commands:*\n"
-            "/stats - Bekijk statistieken\n"
-            "/top - Beste deals sinds herstart\n"
-            "/settings - Bekijk/wijzig instellingen\n"
-            "/pause - Scannen tijdelijk stoppen\n"
-            "/resume - Scannen hervatten\n"
-            "/help - Deze uitleg"
+            "/stats - Statistieken\n"
+            "/top - Beste deals\n"
+            "/settings - Instellingen\n"
+            "/pause - Pauzeren\n"
+            "/resume - Hervatten"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -1318,7 +1482,9 @@ class BotCommands:
             f"Status: {status}\n\n"
             f"🔍 Scans: {stats['scans']}\n"
             f"📋 Listings bekeken: {stats['listings_checked']}\n"
-            f"💰 Deals gevonden: {stats['deals_found']}\n\n"
+            f"💰 Deals gevonden: {stats['deals_found']}\n"
+            f"🚨 Urgente deals: {stats['urgent_deals']}\n"
+            f"👀 Watchlist deals: {stats['watchlist_deals']}\n\n"
             f"⚡ Scan interval: {self.settings.check_interval}s\n"
             f"🎯 Min. winst: €{self.settings.min_profit_margin}\n"
         )
@@ -1331,9 +1497,9 @@ class BotCommands:
         self.settings.paused = True
         save_runtime_settings(self.settings)
         await update.message.reply_text(
-            "⏸️ Bot gepauzeerd. Er wordt niet meer gescand tot je /resume gebruikt."
+            "⏸️ Bot gepauzeerd. Gebruik /resume om te hervatten."
         )
-        logger.info("⏸️ Bot gepauzeerd via Telegram command")
+        logger.info("⏸️ Bot gepauzeerd via Telegram")
 
     async def resume(self, update, context):
         if not self._is_authorized(update):
@@ -1341,8 +1507,8 @@ class BotCommands:
 
         self.settings.paused = False
         save_runtime_settings(self.settings)
-        await update.message.reply_text("▶️ Bot hervat, scannen gaat weer verder.")
-        logger.info("▶️ Bot hervat via Telegram command")
+        await update.message.reply_text("▶️ Bot hervat!")
+        logger.info("▶️ Bot hervat via Telegram")
 
     async def settings_cmd(self, update, context):
         if not self._is_authorized(update):
@@ -1355,7 +1521,7 @@ class BotCommands:
                 "⚙️ *Huidige instellingen*\n\n"
                 f"🎯 Min. winst: €{self.settings.min_profit_margin}\n"
                 f"🛣️ Max. KM: {self.settings.max_km:,}\n"
-                f"💶 Max €/km (sanity-check): {self.settings.price_per_km_limit}\n"
+                f"💶 Max €/km: {self.settings.price_per_km_limit}\n"
                 f"⏱️ Scan interval: {self.settings.check_interval}s\n"
                 f"Status: {'⏸️ GEPAUZEERD' if self.settings.paused else '▶️ ACTIEF'}\n\n"
                 "*Wijzigen:*\n"
@@ -1370,8 +1536,7 @@ class BotCommands:
 
         if len(args) < 2:
             await update.message.reply_text(
-                "⚠️ Gebruik: /settings <optie> <waarde>\n"
-                "Bijvoorbeeld: /settings minprofit 300"
+                "⚠️ Gebruik: /settings <optie> <waarde>"
             )
             return
 
@@ -1386,43 +1551,40 @@ class BotCommands:
                     return
                 self.settings.min_profit_margin = value
                 save_runtime_settings(self.settings)
-                await update.message.reply_text(f"✅ Min. winst ingesteld op €{value}")
+                await update.message.reply_text(f"✅ Min. winst: €{value}")
 
             elif option == "maxkm":
                 value = int(value_raw)
                 if not (0 < value <= 1_000_000):
-                    await update.message.reply_text("⚠️ Max KM moet tussen 1 en 1.000.000 liggen.")
+                    await update.message.reply_text("⚠️ Max KM: 1-1.000.000")
                     return
                 self.settings.max_km = value
                 save_runtime_settings(self.settings)
-                await update.message.reply_text(f"✅ Max. KM ingesteld op {value:,}")
+                await update.message.reply_text(f"✅ Max. KM: {value:,}")
 
             elif option == "pricekm":
                 value = float(value_raw)
                 if not (0 < value <= 5):
-                    await update.message.reply_text("⚠️ Max €/km moet tussen 0 en 5 liggen.")
+                    await update.message.reply_text("⚠️ Max €/km: 0-5")
                     return
                 self.settings.price_per_km_limit = value
                 save_runtime_settings(self.settings)
-                await update.message.reply_text(f"✅ Max €/km ingesteld op {value}")
+                await update.message.reply_text(f"✅ Max €/km: {value}")
 
             elif option == "interval":
                 value = int(value_raw)
                 if not (3 <= value <= 3600):
-                    await update.message.reply_text("⚠️ Interval moet tussen 3 en 3600 seconden liggen.")
+                    await update.message.reply_text("⚠️ Interval: 3-3600s")
                     return
                 self.settings.check_interval = value
                 save_runtime_settings(self.settings)
-                await update.message.reply_text(
-                    f"✅ Scan interval ingesteld op {value}s\n"
-                    f"(gaat in vanaf de volgende scan-cyclus)"
-                )
+                await update.message.reply_text(f"✅ Interval: {value}s")
             else:
                 await update.message.reply_text(
-                    "⚠️ Onbekende optie. Gebruik: minprofit, maxkm, pricekm of interval."
+                    "⚠️ Opties: minprofit, maxkm, pricekm, interval"
                 )
         except ValueError:
-            await update.message.reply_text("⚠️ Ongeldige waarde, gebruik een getal.")
+            await update.message.reply_text("⚠️ Ongeldige waarde")
 
     async def top(self, update, context):
         if not self._is_authorized(update):
@@ -1432,15 +1594,17 @@ class BotCommands:
 
         if not top_deals:
             await update.message.reply_text(
-                "📭 Nog geen deals gevonden sinds de laatste herstart."
+                "📭 Nog geen deals sinds herstart."
             )
             return
 
-        lines = ["🏆 *Top deals sinds laatste herstart:*\n"]
+        lines = ["🏆 *Top 5 deals:*\n"]
         for i, deal in enumerate(top_deals, start=1):
             profit = deal.market_analysis.profit_potential if deal.market_analysis else 0
+            urgent = " 🚨" if deal.is_urgent else ""
             lines.append(
-                f"{i}. {deal.deal_quality.value} — {deal.brand} {deal.model} {deal.year}\n"
+                f"{i}. {deal.deal_quality.value}{urgent}\n"
+                f"   {deal.brand} {deal.model} {deal.year}\n"
                 f"   €{deal.price:,} → winst €{profit:,}\n"
                 f"   {deal.url}"
             )
@@ -1456,7 +1620,7 @@ class BotCommands:
 # ---------------------------------------------------------
 
 async def telegram_error_handler(update, context):
-    logger.error(f"Telegram handler error: {context.error}", exc_info=context.error)
+    logger.error(f"Telegram error: {context.error}", exc_info=context.error)
 
 # ---------------------------------------------------------
 # MAIN BOT
@@ -1490,21 +1654,21 @@ class ProfitBot:
         signal.signal(signal.SIGINT, handle)
 
     async def _scan_loop(self):
-        logger.info("🚀 Profit scan gestart")
+        logger.info("🚀 Profit scan gestart (v2.0)")
         await self.notifier.send_startup(self.settings.min_profit_margin)
 
         async with SmartClient(self.bot_config) as client:
             while not self._shutdown.is_set():
 
                 if self.settings.paused:
-                    logger.info("⏸️ Gepauzeerd, sla scan over")
+                    logger.info("⏸️ Gepauzeerd")
                 else:
                     try:
                         deals = await self.scraper.scan_all(client)
 
                         for deal in deals:
                             await self.notifier.send_listing(deal)
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(1)  # Verlaagd van 2 naar 1
 
                         await self.seen_manager.cleanup_and_save()
 
@@ -1548,7 +1712,7 @@ class ProfitBot:
         await self.seen_manager.cleanup_and_save()
 
     def run(self):
-        logger.info("💰 PROFIT BOT START")
+        logger.info("💰 PROFIT BOT START v2.0")
         logger.info(f"🎯 Min winst: €{self.settings.min_profit_margin}")
 
         try:
