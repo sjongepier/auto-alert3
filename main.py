@@ -4,444 +4,1047 @@ import logging
 import asyncio
 import aiohttp
 import re
-import random
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional, List, Dict
-from datetime import datetime
-from telegram.ext import ApplicationBuilder
+import signal
 import hashlib
+import statistics
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Optional, Dict, List, Set, Tuple
+from datetime import datetime, timedelta
+from enum import Enum
+from telegram.ext import ApplicationBuilder
+import sys
 
-# ============================================
-# MULTI-PLATFORM BOT - ANTI-DETECTIE
-# ============================================
+# ---------------------------------------------------------
+# CONSTANTS & ENUMS
+# ---------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
+class DealQuality(Enum):
+    """Kwaliteit van de deal."""
+    GODLIKE = "GODLIKE"      # €1000+ winst
+    EXCELLENT = "EXCELLENT"   # €500-1000 winst
+    GOOD = "GOOD"            # €300-500 winst
+    AVERAGE = "AVERAGE"      # €150-300 winst
+    POOR = "POOR"            # <€150 winst
 
-# Roterende User Agents
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-]
+PRICE_CENT_THRESHOLD = 100_000
 
-@dataclass
-class Config:
+# ---------------------------------------------------------
+# CONFIG MANAGEMENT
+# ---------------------------------------------------------
+
+@dataclass(frozen=True)
+class BotConfig:
+    """Immutable configuratie voor de bot."""
+    
     telegram_token: str
     telegram_chat_id: str
-    check_interval: int = 180  # 3 min tussen scans
-    max_price: int = 6000
-    max_km: int = 200000
-    request_delay: float = 3.0  # Seconds tussen requests
+    check_interval: int = 8
+    max_concurrent_requests: int = 8
+    request_timeout: int = 15
+    max_retries: int = 3
+    
+    # Deal filtering
+    min_profit_margin: int = 500  # Minimaal €500 winst
+    max_km: int = 220_000
+    price_per_km_limit: float = 0.04
+    seen_max_age_days: int = 30
+    
+    # Market value calculation
+    market_value_samples: int = 10  # Hoeveel vergelijkbare auto's checken
+    
+    seen_file: Path = field(default_factory=lambda: Path("seen_links.json"))
     
     @classmethod
-    def from_env(cls):
+    def from_env(cls) -> 'BotConfig':
+        token = os.getenv("TELEGRAM_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        
+        if not token or not chat_id:
+            raise ValueError("TELEGRAM_TOKEN en TELEGRAM_CHAT_ID zijn vereist")
+        
         return cls(
-            telegram_token=os.getenv("TELEGRAM_TOKEN", ""),
-            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "")
+            telegram_token=token,
+            telegram_chat_id=chat_id,
+            check_interval=int(os.getenv("CHECK_INTERVAL", 8)),
+            min_profit_margin=int(os.getenv("MIN_PROFIT_MARGIN", 500)),
         )
 
-@dataclass
-class Deal:
-    title: str
-    price: int
-    url: str
-    platform: str
-    km: Optional[int] = None
-    year: Optional[int] = None
+@dataclass(frozen=True)
+class FilterConfig:
+    """Configuratie voor filtering."""
+    models: List[str]
+    motivation_words: List[str]
+    dealer_words: List[str]
+    red_flags: List[str]
+    quality_indicators: List[str]
     
-    def format_message(self) -> str:
-        icons = {"marktplaats": "🟠", "autoscout24": "🟢", "gaspedaal": "🔵"}
-        icon = icons.get(self.platform, "⚪")
-        km_str = f"{self.km:,} km" if self.km else "?"
-        year_str = f"{self.year}" if self.year else "?"
+    @classmethod
+    def from_file(cls, path: Path) -> 'FilterConfig':
+        if not path.exists():
+            raise FileNotFoundError(f"filters.json niet gevonden")
         
-        return (
-            f"🔥 DEAL GEVONDEN!\n"
-            f"{icon} {self.platform.upper()}\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"📋 {self.title[:80]}\n\n"
-            f"💶 Prijs: €{self.price:,}\n"
-            f"🚗 KM: {km_str}\n"
-            f"📅 Jaar: {year_str}\n"
-            f"🔗 {self.url}\n\n"
-            f"⚡ Direct bellen!"
-        )
+        data = json.loads(path.read_text())
+        return cls(**data)
 
-class SmartHTTPClient:
-    """HTTP client met anti-detectie"""
-    
-    def __init__(self, delay: float = 3.0):
-        self.delay = delay
-        self.session: Optional[aiohttp.ClientSession] = None
-        self._last_request = {}
-    
-    async def __aenter__(self):
-        # Realistische browser headers
-        self.session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=False, limit=5),
-            timeout=aiohttp.ClientTimeout(total=20),
-        )
-        return self
-    
-    async def __aexit__(self, *args):
-        if self.session:
-            await self.session.close()
-    
-    def _get_headers(self, url: str) -> Dict[str, str]:
-        """Generate realistische headers per domain"""
-        domain = re.search(r'https?://(?:www\.)?([^/]+)', url).group(1)
-        
-        headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Cache-Control": "max-age=0",
-        }
-        
-        # Domain-specific headers
-        if "marktplaats" in domain:
-            headers["Referer"] = "https://www.google.nl/"
-        elif "autoscout24" in domain:
-            headers["Referer"] = "https://www.autoscout24.nl/"
-        elif "gaspedaal" in domain:
-            headers["Referer"] = "https://www.gaspedaal.nl/"
-        
-        return headers
-    
-    async def get(self, url: str, retry: int = 3) -> Optional[str]:
-        """GET request met rate limiting en retry"""
-        domain = re.search(r'https?://(?:www\.)?([^/]+)', url).group(1)
-        
-        # Rate limiting per domain
-        now = asyncio.get_event_loop().time()
-        last = self._last_request.get(domain, 0)
-        wait = self.delay - (now - last)
-        
-        if wait > 0:
-            await asyncio.sleep(wait)
-        
-        self._last_request[domain] = asyncio.get_event_loop().time()
-        
-        for attempt in range(retry):
-            try:
-                headers = self._get_headers(url)
-                
-                async with self.session.get(url, headers=headers, allow_redirects=True) as resp:
-                    if resp.status == 200:
-                        return await resp.text()
-                    
-                    elif resp.status == 403:
-                        logger.warning(f"🚫 403 op {domain} - probeer langzamere requests")
-                        await asyncio.sleep(5 * (attempt + 1))
-                        continue
-                    
-                    elif resp.status == 429:
-                        wait = 10 * (attempt + 1)
-                        logger.warning(f"⏸ Rate limit - wacht {wait}s")
-                        await asyncio.sleep(wait)
-                        continue
-                    
-                    else:
-                        logger.debug(f"HTTP {resp.status} voor {url[:50]}")
-                        return None
-            
-            except asyncio.TimeoutError:
-                logger.warning(f"⏱ Timeout op {url[:50]}")
-                await asyncio.sleep(2)
-            
-            except Exception as e:
-                logger.error(f"Request fout: {e}")
-                return None
-        
-        return None
+# ---------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------
 
-class Parser:
-    """Universele parser voor alle platforms"""
+class ColoredFormatter(logging.Formatter):
+    COLORS = {
+        'DEBUG': '\033[36m',
+        'INFO': '\033[32m',
+        'WARNING': '\033[33m',
+        'ERROR': '\033[31m',
+        'CRITICAL': '\033[35m',
+    }
+    RESET = '\033[0m'
     
-    @staticmethod
-    def extract_price(text: str) -> Optional[int]:
+    def format(self, record):
+        log_color = self.COLORS.get(record.levelname, self.RESET)
+        record.levelname = f"{log_color}{record.levelname}{self.RESET}"
+        return super().format(record)
+
+def setup_logging(level: int = logging.INFO) -> logging.Logger:
+    logger = logging.getLogger("profit-bot")
+    logger.setLevel(level)
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(
+        ColoredFormatter("%(asctime)s [%(levelname)s] %(message)s")
+    )
+    logger.addHandler(console_handler)
+    
+    file_handler = logging.FileHandler("bot.log")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    )
+    logger.addHandler(file_handler)
+    
+    return logger
+
+logger = setup_logging()
+
+# ---------------------------------------------------------
+# MARKET VALUE CALCULATOR
+# ---------------------------------------------------------
+
+class MarketValueCalculator:
+    """Bereken marktwaarde op basis van vergelijkbare auto's."""
+    
+    def __init__(self):
+        self._cache: Dict[str, Tuple[float, datetime]] = {}
+        self._cache_ttl = timedelta(hours=6)
+    
+    def _get_cache_key(self, brand: str, model: str, year: int, km: int) -> str:
+        """Generate cache key."""
+        km_bracket = (km // 20000) * 20000  # Round to 20k brackets
+        return f"{brand}_{model}_{year}_{km_bracket}"
+    
+    async def get_market_value(
+        self,
+        brand: str,
+        model: str,
+        year: int,
+        km: int,
+        client: 'SmartClient'
+    ) -> Optional[float]:
+        """Bereken marktwaarde op basis van AutoScout24 data."""
+        
+        # Check cache
+        cache_key = self._get_cache_key(brand, model, year, km)
+        if cache_key in self._cache:
+            value, timestamp = self._cache[cache_key]
+            if datetime.now() - timestamp < self._cache_ttl:
+                logger.debug(f"💰 Cache hit voor {brand} {model} {year}: €{value:.0f}")
+                return value
+        
+        # Zoek vergelijkbare auto's op AutoScout24
+        search_url = (
+            f"https://www.autoscout24.nl/lst?"
+            f"mmvmk0={brand}&mmvmd0={model}&mmvco=1"
+            f"&fregfrom={year-1}&fregto={year+1}"
+            f"&kmfrom={km-30000}&kmto={km+30000}"
+            f"&sort=standard&desc=0&ustate=N%2CU"
+            f"&size=20&page=0&cy=NL&atype=C"
+        )
+        
+        html = await client.get_html(search_url)
+        if not html:
+            logger.warning(f"⚠️  Geen marktdata voor {brand} {model} {year}")
+            return None
+        
+        # Extract prijzen uit HTML
+        prices = self._extract_prices(html)
+        
+        if len(prices) < 3:
+            logger.warning(f"⚠️  Te weinig data ({len(prices)} auto's) voor {brand} {model}")
+            return None
+        
+        # Bereken mediaan (beter dan gemiddelde voor outliers)
+        market_value = statistics.median(prices)
+        
+        # Cache result
+        self._cache[cache_key] = (market_value, datetime.now())
+        
+        logger.info(f"💰 Marktwaarde {brand} {model} {year}: €{market_value:.0f} (van {len(prices)} auto's)")
+        
+        return market_value
+    
+    def _extract_prices(self, html: str) -> List[float]:
+        """Extract prijzen uit AutoScout24 HTML."""
+        prices = []
+        
+        # Pattern voor prijzen
         patterns = [
-            r'€\s*([0-9]{1,3}(?:[.,][0-9]{3})*)',
-            r'"price"[:\s]+([0-9]+)',
-            r'prijs[^0-9]+([0-9.,]+)',
+            r'data-price="(\d+)"',
+            r'"price"\s*:\s*(\d+)',
+            r'€\s*([\d.]+)',
         ]
         
         for pattern in patterns:
-            matches = re.findall(pattern, text, re.I)
+            matches = re.findall(pattern, html)
             for match in matches:
                 try:
-                    price = int(re.sub(r'[.,]', '', match))
+                    # Clean price
+                    price_str = match.replace('.', '')
+                    price = float(price_str)
+                    
+                    # Validatie: redelijke auto prijs
                     if 500 < price < 50000:
-                        return price
-                except:
+                        prices.append(price)
+                except (ValueError, AttributeError):
                     continue
+        
+        # Remove duplicates en sorteer
+        prices = sorted(list(set(prices)))
+        
+        return prices
+
+# ---------------------------------------------------------
+# DATACLASSES
+# ---------------------------------------------------------
+
+@dataclass
+class MarketAnalysis:
+    """Markt analyse van een auto."""
+    asking_price: int
+    market_value: Optional[float]
+    profit_potential: Optional[int]
+    profit_percentage: Optional[float]
+    is_profitable: bool
+    
+    @classmethod
+    def analyze(
+        cls,
+        asking_price: int,
+        market_value: Optional[float],
+        min_profit: int
+    ) -> 'MarketAnalysis':
+        """Analyseer winstpotentieel."""
+        
+        if not market_value:
+            return cls(
+                asking_price=asking_price,
+                market_value=None,
+                profit_potential=None,
+                profit_percentage=None,
+                is_profitable=False
+            )
+        
+        # Bereken winst (conservatief: -10% voor verkoop kosten)
+        sell_price = market_value * 0.90
+        profit = int(sell_price - asking_price)
+        profit_pct = (profit / asking_price * 100) if asking_price > 0 else 0
+        
+        return cls(
+            asking_price=asking_price,
+            market_value=market_value,
+            profit_potential=profit,
+            profit_percentage=profit_pct,
+            is_profitable=profit >= min_profit
+        )
+
+@dataclass
+class Listing:
+    """Representatie van een listing."""
+    url: str
+    title: str
+    price: int
+    platform: str
+    km: Optional[int] = None
+    year: Optional[int] = None
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    description: str = ""
+    timestamp: datetime = field(default_factory=datetime.now)
+    
+    # Computed fields
+    motivated_seller: bool = field(default=False, init=False, repr=False)
+    is_dealer: bool = field(default=False, init=False, repr=False)
+    has_red_flags: bool = field(default=False, init=False, repr=False)
+    quality_score: int = field(default=0, init=False, repr=False)
+    market_analysis: Optional[MarketAnalysis] = field(default=None, init=False, repr=False)
+    deal_quality: DealQuality = field(default=DealQuality.POOR, init=False, repr=False)
+    
+    def __post_init__(self):
+        if self.price < 0:
+            raise ValueError(f"Prijs kan niet negatief zijn: {self.price}")
+        if self.km is not None and self.km < 0:
+            raise ValueError(f"KM kan niet negatief zijn: {self.km}")
+        if self.year is not None and (self.year < 1990 or self.year > datetime.now().year + 1):
+            raise ValueError(f"Ongeldig bouwjaar: {self.year}")
+        
+        # Extract brand/model van title
+        if not self.brand or not self.model:
+            self._extract_brand_model()
+    
+    def _extract_brand_model(self):
+        """Extract merk en model uit titel."""
+        title_lower = self.title.lower()
+        
+        # Brand mapping
+        brands = {
+            'toyota': ['aygo', 'yaris', 'corolla'],
+            'peugeot': ['107', '108', '206', '207'],
+            'citroen': ['c1', 'c2', 'c3'],
+            'kia': ['picanto', 'rio'],
+            'hyundai': ['i10', 'i20'],
+            'volkswagen': ['up', 'polo'],
+            'seat': ['mii', 'ibiza'],
+            'skoda': ['citigo', 'fabia'],
+        }
+        
+        for brand, models in brands.items():
+            if brand in title_lower:
+                self.brand = brand.capitalize()
+                for model in models:
+                    if model in title_lower:
+                        self.model = model.capitalize()
+                        return
+        
+        # Fallback: eerste woord is vaak merk
+        words = self.title.split()
+        if words:
+            self.brand = words[0]
+            if len(words) > 1:
+                self.model = words[1]
+    
+    async def analyze(
+        self,
+        filter_config: FilterConfig,
+        bot_config: BotConfig,
+        market_calculator: MarketValueCalculator,
+        client: 'SmartClient'
+    ) -> None:
+        """Volledige analyse van de listing."""
+        
+        combined_text = f"{self.title} {self.description}".lower()
+        
+        # Basic checks
+        self.is_dealer = any(word in combined_text for word in filter_config.dealer_words)
+        self.motivated_seller = any(word in combined_text for word in filter_config.motivation_words)
+        self.has_red_flags = any(flag in combined_text for flag in filter_config.red_flags)
+        
+        self.quality_score = sum(
+            1 for indicator in filter_config.quality_indicators 
+            if indicator in combined_text
+        )
+        
+        # Instant reject conditions
+        if self.is_dealer or self.has_red_flags:
+            self.deal_quality = DealQuality.POOR
+            return
+        
+        if not self.year or not self.km or not self.brand or not self.model:
+            self.deal_quality = DealQuality.POOR
+            return
+        
+        if self.km > bot_config.max_km:
+            self.deal_quality = DealQuality.POOR
+            return
+        
+        if self.price / self.km > bot_config.price_per_km_limit:
+            self.deal_quality = DealQuality.POOR
+            return
+        
+        # Get market value
+        market_value = await market_calculator.get_market_value(
+            self.brand,
+            self.model,
+            self.year,
+            self.km,
+            client
+        )
+        
+        # Analyze profit potential
+        self.market_analysis = MarketAnalysis.analyze(
+            self.price,
+            market_value,
+            bot_config.min_profit_margin
+        )
+        
+        if not self.market_analysis.is_profitable:
+            self.deal_quality = DealQuality.POOR
+            return
+        
+        # Calculate deal quality based on profit
+        profit = self.market_analysis.profit_potential or 0
+        
+        if profit >= 1000:
+            self.deal_quality = DealQuality.GODLIKE
+        elif profit >= 500:
+            self.deal_quality = DealQuality.EXCELLENT
+        elif profit >= 300:
+            self.deal_quality = DealQuality.GOOD
+        elif profit >= 150:
+            self.deal_quality = DealQuality.AVERAGE
+        else:
+            self.deal_quality = DealQuality.POOR
+    
+    @property
+    def is_good_deal(self) -> bool:
+        """Check of dit een goede deal is."""
+        return self.deal_quality in (DealQuality.GODLIKE, DealQuality.EXCELLENT, DealQuality.GOOD)
+    
+    def format_message(self) -> str:
+        """Premium notificatie format met winst berekening."""
+        
+        quality_emoji = {
+            DealQuality.GODLIKE: "💎💎💎",
+            DealQuality.EXCELLENT: "🔥🔥",
+            DealQuality.GOOD: "🔥",
+            DealQuality.AVERAGE: "✅",
+            DealQuality.POOR: "❌",
+        }
+        
+        emoji = quality_emoji[self.deal_quality]
+        
+        # Urgency
+        urgency = ""
+        if self.motivated_seller:
+            urgency = "\n🚨 GEMOTIVEERDE VERKOPER!"
+        
+        # Quality
+        quality_stars = "⭐" * min(self.quality_score, 5)
+        quality_info = f"\n{quality_stars} Kwaliteit: {self.quality_score}/10" if self.quality_score > 0 else ""
+        
+        # Market analysis
+        market_info = ""
+        if self.market_analysis and self.market_analysis.market_value:
+            profit = self.market_analysis.profit_potential
+            profit_pct = self.market_analysis.profit_percentage
+            market_val = self.market_analysis.market_value
+            
+            market_info = (
+                f"\n\n💰 WINST ANALYSE:\n"
+                f"├─ Vraagprijs: €{self.price:,}\n"
+                f"├─ Marktwaarde: €{market_val:,.0f}\n"
+                f"├─ Verkoopprijs*: €{market_val * 0.9:,.0f}\n"
+                f"└─ Winst: €{profit:,} ({profit_pct:.0f}%)\n"
+                f"\n*Na 10% kosten (reparatie/APK/verkoop)"
+            )
+        
+        time_posted = self.timestamp.strftime("%H:%M:%S")
+        km_str = f"{self.km:,}" if self.km else "onbekend"
+        
+        return (
+            f"{emoji} {self.deal_quality.value} DEAL!\n"
+            f"{'━' * 30}\n"
+            f"🚗 {self.title}\n"
+            f"\n📊 SPECIFICATIES:\n"
+            f"├─ Merk: {self.brand or '?'} {self.model or ''}\n"
+            f"├─ Bouwjaar: {self.year}\n"
+            f"├─ KM-stand: {km_str}\n"
+            f"└─ Gevonden: {time_posted}\n"
+            f"{market_info}"
+            f"{quality_info}"
+            f"{urgency}\n"
+            f"{'━' * 30}\n"
+            f"🔗 {self.url}\n\n"
+            f"⚡ ACTIE: Screenshot + Direct Bellen!\n"
+            f"💡 TIP: Bied €{self.price - 200:,} (onderhandelen)"
+        )
+
+# ---------------------------------------------------------
+# SEEN LINKS MANAGER
+# ---------------------------------------------------------
+
+class SeenLinksManager:
+    def __init__(self, path: Path, max_age_days: int):
+        self._path = path
+        self._max_age = timedelta(days=max_age_days)
+        self._data: Dict[str, datetime] = {}
+        self._lock = asyncio.Lock()
+        self._load()
+    
+    def _load(self):
+        if not self._path.exists():
+            return
+        
+        try:
+            raw_data = json.loads(self._path.read_text())
+            self._data = {
+                url: datetime.fromisoformat(ts)
+                for url, ts in raw_data.items()
+            }
+            logger.info(f"Geladen: {len(self._data)} geziene links")
+        except Exception as e:
+            logger.warning(f"Kon seen links niet laden: {e}")
+            self._data = {}
+    
+    def _save(self):
+        try:
+            raw_data = {url: dt.isoformat() for url, dt in self._data.items()}
+            self._path.write_text(json.dumps(raw_data, indent=2))
+        except Exception as e:
+            logger.error(f"Save error: {e}")
+    
+    def _clean_expired(self):
+        cutoff = datetime.now() - self._max_age
+        original = len(self._data)
+        self._data = {url: dt for url, dt in self._data.items() if dt > cutoff}
+        removed = original - len(self._data)
+        if removed > 0:
+            logger.info(f"Cleanup: {removed} oude links verwijderd")
+    
+    async def contains(self, url: str) -> bool:
+        async with self._lock:
+            return url in self._data
+    
+    async def add(self, url: str):
+        async with self._lock:
+            self._data[url] = datetime.now()
+    
+    async def cleanup_and_save(self):
+        async with self._lock:
+            self._clean_expired()
+            self._save()
+
+# ---------------------------------------------------------
+# HTTP CLIENT
+# ---------------------------------------------------------
+
+class SmartClient:
+    """Smart HTTP client met anti-detection."""
+    
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    ]
+    
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._semaphore = asyncio.Semaphore(config.max_concurrent_requests)
+        self._stats = {"requests": 0, "errors": 0, "blocked": 0}
+        self._ua_index = 0
+        self._domain_delays: Dict[str, datetime] = {}
+    
+    def _rotate_ua(self) -> str:
+        ua = self.USER_AGENTS[self._ua_index]
+        self._ua_index = (self._ua_index + 1) % len(self.USER_AGENTS)
+        return ua
+    
+    def _get_domain(self, url: str) -> str:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc
+    
+    async def _rate_limit(self, url: str):
+        domain = self._get_domain(url)
+        if domain in self._domain_delays:
+            elapsed = (datetime.now() - self._domain_delays[domain]).total_seconds()
+            if elapsed < 1.5:
+                await asyncio.sleep(1.5 - elapsed)
+        self._domain_delays[domain] = datetime.now()
+    
+    async def __aenter__(self):
+        connector = aiohttp.TCPConnector(
+            limit=self.config.max_concurrent_requests,
+            limit_per_host=2,
+            ttl_dns_cache=300,
+        )
+        
+        timeout = aiohttp.ClientTimeout(total=self.config.request_timeout)
+        self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._session:
+            await self._session.close()
+    
+    async def get_html(self, url: str) -> Optional[str]:
+        if not self._session:
+            raise RuntimeError("Client niet geïnitialiseerd")
+        
+        await self._rate_limit(url)
+        
+        async with self._semaphore:
+            for attempt in range(1, self.config.max_retries + 1):
+                try:
+                    self._stats["requests"] += 1
+                    
+                    headers = {
+                        "User-Agent": self._rotate_ua(),
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "DNT": "1",
+                        "Connection": "keep-alive",
+                        "Upgrade-Insecure-Requests": "1",
+                    }
+                    
+                    async with self._session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            return await response.text()
+                        elif response.status == 403:
+                            self._stats["blocked"] += 1
+                            wait = min(2 ** attempt * 3, 30)
+                            logger.warning(f"🚫 Blocked, wacht {wait}s")
+                            await asyncio.sleep(wait)
+                        elif response.status in (429, 503):
+                            wait = 2 ** attempt
+                            await asyncio.sleep(wait)
+                        elif response.status == 404:
+                            return None
+                        else:
+                            return None
+                
+                except Exception as e:
+                    self._stats["errors"] += 1
+                    if attempt < self.config.max_retries:
+                        await asyncio.sleep(2 ** attempt)
+        
         return None
+    
+    def get_stats(self) -> Dict[str, int]:
+        return self._stats.copy()
+
+# ---------------------------------------------------------
+# PARSING
+# ---------------------------------------------------------
+
+class ListingParser:
+    
+    @staticmethod
+    def parse_marktplaats_json(html: str) -> Tuple[Optional[str], Optional[int], str]:
+        match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if not match:
+            return None, None, ""
+        
+        try:
+            data = json.loads(match.group(1))
+            listing = data.get("props", {}).get("pageProps", {}).get("listing", {})
+            
+            title = listing.get("title", "").strip()
+            description = listing.get("description", "").strip()
+            price_info = listing.get("priceInfo", {})
+            
+            raw_price = (
+                price_info.get("priceCents") or
+                price_info.get("price") or
+                price_info.get("askingPrice")
+            )
+            
+            if not title or raw_price is None:
+                return None, None, ""
+            
+            price = int(raw_price)
+            if price > PRICE_CENT_THRESHOLD:
+                price = price // 100
+            
+            return title, price, description
+        
+        except Exception:
+            return None, None, ""
     
     @staticmethod
     def extract_km(text: str) -> Optional[int]:
-        match = re.search(r'(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*km', text.lower())
-        if match:
-            try:
-                km = int(re.sub(r'[.,\s]', '', match.group(1)))
-                if 100 < km < 500000:
-                    return km
-            except:
-                pass
+        """Extract KM met verbeterde patterns."""
+        patterns = [
+            r'(\d{1,3}(?:[.,\s]\d{3})+)\s*km',  # 123.456 km
+            r'(\d{4,6})\s*km',                   # 123456 km
+            r'km[:\s]+(\d{1,3}(?:[.,\s]\d{3})+)',  # km: 123.456
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text.lower())
+            if match:
+                raw = re.sub(r'[.,\s]', '', match.group(1))
+                try:
+                    km = int(raw)
+                    if 1000 < km < 500_000:  # Redelijke range
+                        return km
+                except ValueError:
+                    continue
+        
         return None
     
     @staticmethod
     def extract_year(text: str) -> Optional[int]:
-        matches = re.findall(r'\b(19[89]\d|20[0-2]\d)\b', text)
-        if matches:
-            years = [int(y) for y in matches if 1995 <= int(y) <= 2024]
-            return max(years) if years else None
+        """Extract bouwjaar - VERBETERD."""
+        current_year = datetime.now().year
+        
+        # Specifieke patterns (bouwjaar, jaartal, etc)
+        specific_patterns = [
+            r'bouwjaar[:\s]+(\d{4})',
+            r'jaar[:\s]+(\d{4})',
+            r'(\d{4})\s+model',
+            r'bj[:\s]+(\d{4})',
+        ]
+        
+        for pattern in specific_patterns:
+            match = re.search(pattern, text.lower())
+            if match:
+                try:
+                    year = int(match.group(1))
+                    if 1990 <= year <= current_year:
+                        return year
+                except ValueError:
+                    continue
+        
+        # Fallback: zoek alle 4-cijferige getallen
+        all_years = re.findall(r'\b(19[9]\d|20[0-2]\d)\b', text)
+        
+        if all_years:
+            # Filter valide jaren
+            valid = [int(y) for y in all_years if 1990 <= int(y) <= current_year]
+            if valid:
+                # Neem meest voorkomende, of anders oudste (vaak bouwjaar)
+                from collections import Counter
+                counts = Counter(valid)
+                return counts.most_common(1)[0][0]
+        
         return None
     
     @staticmethod
-    def extract_title(html: str) -> Optional[str]:
-        patterns = [
-            r'<h1[^>]*>([^<]+)</h1>',
-            r'<title>([^<]+)</title>',
-            r'og:title["\s]+content="([^"]+)"',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, html, re.I | re.DOTALL)
-            if match:
-                title = re.sub(r'<[^>]+>', '', match.group(1)).strip()
-                title = re.sub(r'\s+', ' ', title)
-                if len(title) > 10:
-                    return title[:150]
-        return None
+    def extract_listing_links(html: str) -> List[str]:
+        """Extract listing URLs."""
+        pattern = r'href="(/v/auto-s/[^"#?]+)"'
+        links = re.findall(pattern, html)
+        unique_links = list(dict.fromkeys(links))
+        return [f"https://www.marktplaats.nl{link}" for link in unique_links]
 
-class PlatformScraper:
-    """Scraper per platform"""
+# ---------------------------------------------------------
+# RSS MONITOR
+# ---------------------------------------------------------
+
+class MarktplaatsRSSMonitor:
+    """RSS monitor voor Marktplaats."""
     
-    PLATFORMS = {
-        "marktplaats": {
-            "search": "https://www.marktplaats.nl/q/{model}/",
-            "link_pattern": r'href="(/a/[^"]+|/v/auto[^"]+)"',
-        },
-        "autoscout24": {
-            "search": "https://www.autoscout24.nl/lst?sort=age&desc=1&ustate=N%2CU&size=20&cy=NL&atype=C&kmto=200000&priceto=6000&search_id={model}",
-            "link_pattern": r'href="(/aanbod/[^"]+)"',
-        },
-        "gaspedaal": {
-            "search": "https://www.gaspedaal.nl/occasions/aanbod?search={model}&sort=date_desc",
-            "link_pattern": r'href="(/occasions/[0-9]+[^"]*)"',
-        },
-    }
+    def __init__(self, filter_config: FilterConfig):
+        self.filter_config = filter_config
+        self._seen_items: Set[str] = set()
     
-    def __init__(self, config: Config):
-        self.config = config
-        self.seen_file = Path("seen_deals.json")
-        self.seen_urls: set = self._load_seen()
-    
-    def _load_seen(self) -> set:
-        if self.seen_file.exists():
-            try:
-                return set(json.loads(self.seen_file.read_text()))
-            except:
-                return set()
-        return set()
-    
-    def _save_seen(self):
-        self.seen_file.write_text(json.dumps(list(self.seen_urls)[-5000:], indent=2))
-    
-    def _url_hash(self, url: str) -> str:
-        """Maak hash om dubbele listings te detecteren"""
-        clean = re.sub(r'[?#].*', '', url)
-        return hashlib.md5(clean.encode()).hexdigest()
-    
-    async def scrape_platform(self, platform: str, model: str, client: SmartHTTPClient) -> List[Deal]:
-        """Scrape één platform voor één model"""
+    async def check_rss(self, model: str, client: SmartClient) -> List[str]:
+        """Check RSS feed."""
+        rss_url = (
+            f"https://www.marktplaats.nl/lrp/api/search?"
+            f"query={model}&searchInTitleAndDescription=true&limit=25"
+        )
         
-        if platform not in self.PLATFORMS:
+        data = await client.get_html(rss_url)
+        if not data:
             return []
         
-        config = self.PLATFORMS[platform]
-        search_url = config["search"].format(model=model.replace(' ', '+'))
+        new_listings = []
         
-        logger.info(f"🔍 {platform}: {model}")
+        try:
+            json_data = json.loads(data)
+            listings = json_data.get('listings', [])
+            
+            for listing in listings:
+                listing_id = listing.get('itemId')
+                vip_url = listing.get('vipUrl')
+                
+                if listing_id and listing_id not in self._seen_items:
+                    self._seen_items.add(listing_id)
+                    
+                    if vip_url:
+                        new_listings.append(f"https://www.marktplaats.nl{vip_url}")
+            
+            # Cleanup
+            if len(self._seen_items) > 2000:
+                self._seen_items = set(list(self._seen_items)[-1000:])
         
-        html = await client.get(search_url)
+        except Exception as e:
+            logger.debug(f"RSS parse error: {e}")
+        
+        return new_listings
+
+# ---------------------------------------------------------
+# SCRAPER
+# ---------------------------------------------------------
+
+class ProfitScraper:
+    """Main scraper met profit focus."""
+    
+    def __init__(
+        self,
+        bot_config: BotConfig,
+        filter_config: FilterConfig,
+        seen_manager: SeenLinksManager,
+    ):
+        self.bot_config = bot_config
+        self.filter_config = filter_config
+        self.seen_manager = seen_manager
+        self.market_calculator = MarketValueCalculator()
+        self.rss_monitor = MarktplaatsRSSMonitor(filter_config)
+        
+        self._stats = {
+            'scans': 0,
+            'listings_checked': 0,
+            'deals_found': 0,
+        }
+    
+    async def process_listing(
+        self,
+        url: str,
+        client: SmartClient,
+    ) -> Optional[Listing]:
+        """Process een listing met profit analyse."""
+        
+        if await self.seen_manager.contains(url):
+            return None
+        
+        html = await client.get_html(url)
         if not html:
-            return []
+            await self.seen_manager.add(url)
+            return None
         
-        # Extract listing URLs
-        links = re.findall(config["link_pattern"], html)
-        unique_links = list(dict.fromkeys(links))[:15]  # Max 15 per search
+        title, price, description = ListingParser.parse_marktplaats_json(html)
+        if not title or not price:
+            await self.seen_manager.add(url)
+            return None
         
-        deals = []
+        km = ListingParser.extract_km(f"{title} {description} {html}")
+        year = ListingParser.extract_year(f"{title} {description}")
         
-        for link in unique_links:
-            # Maak absolute URL
-            if link.startswith('http'):
-                url = link
-            elif platform == "marktplaats":
-                url = f"https://www.marktplaats.nl{link}"
-            elif platform == "autoscout24":
-                url = f"https://www.autoscout24.nl{link}"
-            elif platform == "gaspedaal":
-                url = f"https://www.gaspedaal.nl{link}"
-            else:
-                continue
-            
-            url_id = self._url_hash(url)
-            
-            if url_id in self.seen_urls:
-                continue
-            
-            # Haal listing op
-            listing_html = await client.get(url)
-            
-            if not listing_html:
-                self.seen_urls.add(url_id)
-                continue
-            
-            # Parse
-            title = Parser.extract_title(listing_html)
-            price = Parser.extract_price(listing_html)
-            
-            if not title or not price:
-                self.seen_urls.add(url_id)
-                continue
-            
-            # Filter
-            if price > self.config.max_price:
-                self.seen_urls.add(url_id)
-                continue
-            
-            km = Parser.extract_km(listing_html)
-            if km and km > self.config.max_km:
-                self.seen_urls.add(url_id)
-                continue
-            
-            year = Parser.extract_year(listing_html)
-            
-            # DEAL!
-            deal = Deal(
+        try:
+            listing = Listing(
+                url=url,
                 title=title,
                 price=price,
-                url=url,
-                platform=platform,
+                platform="marktplaats",
                 km=km,
-                year=year
+                year=year,
+                description=description,
             )
             
-            deals.append(deal)
-            self.seen_urls.add(url_id)
+            await listing.analyze(
+                self.filter_config,
+                self.bot_config,
+                self.market_calculator,
+                client
+            )
             
-            logger.info(f"✅ Deal: {platform} - €{price} - {title[:40]}")
+        except ValueError as e:
+            logger.warning(f"Invalid listing: {e}")
+            await self.seen_manager.add(url)
+            return None
         
+        self._stats['listings_checked'] += 1
+        
+        if not listing.is_good_deal:
+            await self.seen_manager.add(url)
+            return None
+        
+        self._stats['deals_found'] += 1
+        await self.seen_manager.add(url)
+        
+        profit = listing.market_analysis.profit_potential if listing.market_analysis else 0
+        
+        logger.info(
+            f"💰 DEAL: {listing.deal_quality.value} | "
+            f"€{profit} winst | {listing.brand} {listing.model} {listing.year}"
+        )
+        
+        return listing
+    
+    async def scan_model(self, model: str, client: SmartClient) -> List[Listing]:
+        """Scan een model."""
+        
+        new_links = await self.rss_monitor.check_rss(model, client)
+        
+        if new_links:
+            logger.info(f"📡 {model}: {len(new_links)} nieuwe listings")
+        
+        if not new_links:
+            return []
+        
+        tasks = [self.process_listing(link, client) for link in new_links]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        deals = [r for r in results if isinstance(r, Listing) and r is not None]
         return deals
     
-    async def scan_all(self, models: List[str]) -> List[Deal]:
-        """Scan alle platforms voor alle modellen"""
-        all_deals = []
+    async def scan_all(self, client: SmartClient) -> List[Listing]:
+        """Scan alle modellen."""
         
-        async with SmartHTTPClient(delay=self.config.request_delay) as client:
-            
-            for platform in self.PLATFORMS.keys():
-                for model in models:
-                    deals = await self.scrape_platform(platform, model, client)
-                    all_deals.extend(deals)
-                    
-                    if deals:
-                        logger.info(f"🔥 {platform}: {len(deals)} deals voor {model}")
-                    
-                    # Respectvolle delay tussen models
-                    await asyncio.sleep(2)
+        self._stats['scans'] += 1
         
-        self._save_seen()
+        tasks = [
+            self.scan_model(model, client)
+            for model in self.filter_config.models
+        ]
+        
+        results = await asyncio.gather(*tasks)
+        all_deals = [deal for model_deals in results for deal in model_deals]
+        
+        logger.info(
+            f"✅ Scan compleet: {len(all_deals)} profit deals uit "
+            f"{self._stats['listings_checked']} listings"
+        )
+        
         return all_deals
+    
+    def get_stats(self) -> Dict:
+        return self._stats.copy()
 
-class TelegramBot:
-    """Telegram notificaties"""
+# ---------------------------------------------------------
+# TELEGRAM NOTIFIER
+# ---------------------------------------------------------
+
+class TelegramNotifier:
     
-    def __init__(self, config: Config):
-        self.config = config
-        self.app = None
+    def __init__(self, app, chat_id: str):
+        self.app = app
+        self.chat_id = chat_id
+        self._stats = {"sent": 0}
     
-    async def send(self, message: str):
+    async def send_message(self, message: str) -> bool:
         try:
             await self.app.bot.send_message(
-                chat_id=self.config.telegram_chat_id,
+                chat_id=self.chat_id,
                 text=message,
-                disable_web_page_preview=True
+                disable_web_page_preview=True,
             )
+            self._stats["sent"] += 1
+            return True
         except Exception as e:
             logger.error(f"Telegram error: {e}")
+            return False
     
-    async def run_loop(self):
-        """Hoofd scan loop"""
+    async def send_listing(self, listing: Listing) -> bool:
+        return await self.send_message(listing.format_message())
+    
+    async def send_startup(self) -> bool:
+        message = (
+            "💰 PROFIT BOT ACTIEF\n\n"
+            f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"🎯 Min. winst: €{500}\n"
+            f"🚗 Modellen: {len([])}\n"
+            "✅ Monitoring gestart"
+        )
+        return await self.send_message(message)
+
+# ---------------------------------------------------------
+# MAIN BOT
+# ---------------------------------------------------------
+
+class ProfitBot:
+    
+    def __init__(self, bot_config: BotConfig, filter_config: FilterConfig):
+        self.bot_config = bot_config
+        self.filter_config = filter_config
         
-        models = ["toyota aygo", "volkswagen up", "peugeot 107", "kia picanto", "hyundai i10"]
-        
-        scraper = PlatformScraper(self.config)
-        
-        await self.send(
-            f"🤖 Multi-Platform Bot ACTIEF\n\n"
-            f"🌐 Platforms: Marktplaats, Autoscout24, Gaspedaal\n"
-            f"🚗 Modellen: {len(models)}\n"
-            f"💶 Max: €{self.config.max_price:,}\n"
-            f"📏 Max: {self.config.max_km:,} km\n"
-            f"⏱ Interval: {self.config.check_interval}s"
+        self.seen_manager = SeenLinksManager(
+            bot_config.seen_file,
+            bot_config.seen_max_age_days
         )
         
-        while True:
-            try:
-                logger.info("=" * 50)
-                logger.info(f"🔄 Nieuwe scan - {datetime.now().strftime('%H:%M:%S')}")
+        self.scraper = None
+        self.notifier = None
+        self._shutdown = asyncio.Event()
+        
+        self._setup_signals()
+    
+    def _setup_signals(self):
+        def handle(signum, frame):
+            logger.info(f"Shutdown: {signal.Signals(signum).name}")
+            self._shutdown.set()
+        
+        signal.signal(signal.SIGTERM, handle)
+        signal.signal(signal.SIGINT, handle)
+    
+    async def _scan_loop(self):
+        logger.info("🚀 Profit scan gestart")
+        await self.notifier.send_startup()
+        
+        async with SmartClient(self.bot_config) as client:
+            while not self._shutdown.is_set():
+                try:
+                    deals = await self.scraper.scan_all(client)
+                    
+                    for deal in deals:
+                        await self.notifier.send_listing(deal)
+                        await asyncio.sleep(2)
+                    
+                    await self.seen_manager.cleanup_and_save()
                 
-                deals = await scraper.scan_all(models)
+                except Exception:
+                    logger.exception("Scan error")
                 
-                logger.info(f"✅ Scan klaar: {len(deals)} nieuwe deals")
-                
-                for deal in deals:
-                    await self.send(deal.format_message())
-                    await asyncio.sleep(3)  # Telegram rate limit
-                
-            except Exception as e:
-                logger.exception("Scan error")
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown.wait(),
+                        timeout=self.bot_config.check_interval
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    pass
+        
+        logger.info("Bot gestopt")
+    
+    async def _post_init(self, app):
+        self.notifier = TelegramNotifier(app, self.bot_config.telegram_chat_id)
+        self.scraper = ProfitScraper(
+            self.bot_config,
+            self.filter_config,
+            self.seen_manager,
+        )
+        
+        asyncio.create_task(self._scan_loop())
+    
+    async def _post_shutdown(self, app):
+        await self.seen_manager.cleanup_and_save()
+    
+    def run(self):
+        logger.info("💰 PROFIT BOT START")
+        logger.info(f"🎯 Min winst: €{self.bot_config.min_profit_margin}")
+        
+        try:
+            app = (
+                ApplicationBuilder()
+                .token(self.bot_config.telegram_token)
+                .post_init(self._post_init)
+                .post_shutdown(self._post_shutdown)
+                .build()
+            )
             
-            await asyncio.sleep(self.config.check_interval)
-    
-    async def post_init(self, app):
-        self.app = app
-        asyncio.create_task(self.run_loop())
-    
-    def start(self):
-        app = (
-            ApplicationBuilder()
-            .token(self.config.telegram_token)
-            .post_init(self.post_init)
-            .build()
-        )
+            app.run_polling(allowed_updates=[], drop_pending_updates=True)
         
-        logger.info("🚀 Bot starting...")
-        app.run_polling(allowed_updates=[], drop_pending_updates=True)
+        except Exception:
+            logger.exception("Fatal error")
+            sys.exit(1)
+
+# ---------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------
 
 def main():
-    config = Config.from_env()
+    try:
+        bot_config = BotConfig.from_env()
+        filter_config = FilterConfig.from_file(Path("filters.json"))
+        
+        bot = ProfitBot(bot_config, filter_config)
+        bot.run()
     
-    if not config.telegram_token or not config.telegram_chat_id:
-        print("❌ Zet TELEGRAM_TOKEN en TELEGRAM_CHAT_ID environment variables")
-        return
-    
-    bot = TelegramBot(config)
-    bot.start()
+    except Exception:
+        logger.exception("Startup error")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
