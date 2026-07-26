@@ -1,0 +1,63 @@
+{
+  "models": [
+    "aygo",
+    "yaris",
+    "c1",
+    "107",
+    "picanto",
+    "i10",
+    "up",
+    "mii",
+    "citigo"
+  ],
+  "motivation_words": [
+    "snel weg",
+    "moet weg",
+    "emigratie",
+    "inruil",
+    "spoedverkoop",
+    "direct",
+    "haast",
+    "verhuizing",
+    "noodverkoop"
+  ],
+  "dealer_words": [
+    "autohandel",
+    "autobedrijf",
+    "concessionaris",
+    "dealer",
+    "auto bedrijf",
+    "automaat centrum",
+    "occasion handel"
+  ],
+  "red_flags": [
+    "crashed",
+    "gestolen",
+    "defect",
+    "rijdt niet",
+    "motor kapot",
+    "sloperij",
+    "bouwproject"
+  ],
+  "quality_indicators": [
+    "onderhouden",
+    "nap",
+    "apk",
+    "airco",
+    "carplay",
+    "cruise",
+    "camera",
+    "navigatie"
+  ],
+  "model_aliases": {
+    "aygo": ["toyota aygo", "aygo x"],
+    "yaris": ["toyota yaris", "yaris hybrid"],
+    "c1": ["citroen c1"],
+    "107": ["peugeot 107"],
+    "picanto": ["kia picanto"],
+    "i10": ["hyundai i10"],
+    "up": ["volkswagen up", "vw up"],
+    "mii": ["seat mii"],
+    "citigo": ["skoda citigo"]
+  }
+}
