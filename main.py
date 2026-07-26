@@ -74,7 +74,7 @@ class ColoredFormatter(logging.Formatter):
         record.levelname = f"{log_color}{record.levelname}{self.RESET}"
         return super().format(record)
 
-def setup_logging(level: int = logging.DEBUG) -> logging.Logger:
+def setup_logging(level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger("profit-bot")
     logger.setLevel(level)
     
@@ -110,18 +110,18 @@ logger = setup_logging()
 class BotConfig:
     telegram_token: str
     telegram_chat_id: str
-    check_interval: int = 15
+    check_interval: int = 30
     max_concurrent_requests: int = 5
     request_timeout: int = 15
     max_retries: int = 3
 
-    min_profit_margin: int = 500
-    max_km: int = 220_000
-    price_per_km_limit: float = 0.15
-    seen_max_age_days: int = 30
+    min_profit_margin: int = 200
+    max_km: int = 300_000
+    price_per_km_limit: float = 0.20
+    seen_max_age_days: int = 7
 
-    market_value_samples: int = 50
-    market_pool_ttl_hours: int = 4
+    market_value_samples: int = 100
+    market_pool_ttl_hours: int = 2
 
     seen_file: Path = field(default_factory=lambda: Path("seen_links.json"))
 
@@ -136,12 +136,12 @@ class BotConfig:
         return cls(
             telegram_token=token,
             telegram_chat_id=chat_id,
-            check_interval=int(os.getenv("CHECK_INTERVAL", 15)),
-            min_profit_margin=int(os.getenv("MIN_PROFIT_MARGIN", 500)),
-            max_km=int(os.getenv("MAX_KM", 220_000)),
-            price_per_km_limit=float(os.getenv("PRICE_PER_KM_LIMIT", 0.15)),
-            market_value_samples=int(os.getenv("MARKET_VALUE_SAMPLES", 50)),
-            market_pool_ttl_hours=int(os.getenv("MARKET_POOL_TTL_HOURS", 4)),
+            check_interval=int(os.getenv("CHECK_INTERVAL", 30)),
+            min_profit_margin=int(os.getenv("MIN_PROFIT_MARGIN", 200)),
+            max_km=int(os.getenv("MAX_KM", 300_000)),
+            price_per_km_limit=float(os.getenv("PRICE_PER_KM_LIMIT", 0.20)),
+            market_value_samples=int(os.getenv("MARKET_VALUE_SAMPLES", 100)),
+            market_pool_ttl_hours=int(os.getenv("MARKET_POOL_TTL_HOURS", 2)),
         )
 
 
@@ -285,7 +285,7 @@ class RDWClient:
 
             info = results[0]
             self._cache[kenteken] = info
-            logger.debug(f"✅ RDW: {kenteken} → {info.get('merk', '?')} {info.get('handelsbenaming', '?')}")
+            logger.info(f"✅ RDW: {kenteken} → {info.get('merk', '?')} {info.get('handelsbenaming', '?')}")
             return info
 
         except Exception as e:
@@ -335,7 +335,7 @@ class PriceHistoryTracker:
 
 class MarketValueCalculator:
 
-    def __init__(self, samples: int = 50, pool_ttl_hours: int = 4):
+    def __init__(self, samples: int = 100, pool_ttl_hours: int = 2):
         self._pool_cache: Dict[str, Tuple[List[dict], datetime]] = {}
         self._pool_ttl = timedelta(hours=pool_ttl_hours)
         self._samples = samples
@@ -360,7 +360,7 @@ class MarketValueCalculator:
         if search_term in self._pool_cache:
             pool, timestamp = self._pool_cache[search_term]
             if datetime.now() - timestamp < self._pool_ttl:
-                logger.debug(f"📦 Pool cache hit voor {search_term}")
+                logger.info(f"📦 Pool cache hit voor '{search_term}'")
                 return pool
 
         search_url = (
@@ -368,22 +368,22 @@ class MarketValueCalculator:
             f"query={search_term}&searchInTitleAndDescription=true&limit={self._samples}"
         )
 
-        logger.debug(f"🔍 Ophalen pool voor {search_term}")
+        logger.info(f"🔍 Ophalen marktwaarde pool voor '{search_term}'...")
         raw = await client.get_html(search_url)
 
         if not raw:
             if search_term in self._pool_cache:
-                logger.debug(f"Pool-fetch mislukt voor {search_term}, gebruik oude cache")
+                logger.info(f"Pool-fetch mislukt, gebruik oude cache")
                 return self._pool_cache[search_term][0]
-            logger.warning(f"❌ Kon pool niet ophalen voor {search_term}")
+            logger.warning(f"❌ Kon pool niet ophalen voor '{search_term}'")
             return []
 
         try:
             data = json.loads(raw)
             listings = data.get('listings', [])
-            logger.debug(f"📊 {len(listings)} listings gevonden voor {search_term}")
+            logger.info(f"📊 {len(listings)} listings gevonden voor marktwaarde")
         except Exception as e:
-            logger.debug(f"Pool parse error voor {search_term}: {e}")
+            logger.error(f"Pool parse error voor '{search_term}': {e}")
             return []
 
         pool = []
@@ -419,7 +419,7 @@ class MarketValueCalculator:
             })
 
         self._pool_cache[search_term] = (pool, datetime.now())
-        logger.debug(f"✅ Pool opgebouwd voor {search_term}: {len(pool)} bruikbare advertenties")
+        logger.info(f"✅ Pool: {len(pool)} bruikbare advertenties voor '{search_term}'")
 
         return pool
 
@@ -436,12 +436,12 @@ class MarketValueCalculator:
         pool = [p for p in raw_pool if p['url'] != exclude_url]
 
         if not pool:
-            logger.warning(f"❌ Geen pool data voor {search_term}")
+            logger.warning(f"❌ Geen pool data voor '{search_term}'")
             return None, False
 
-        logger.debug(f"🔎 Zoek marktwaarde voor {search_term} {year} ({km:,} km)")
+        logger.info(f"🔎 Zoek marktwaarde: {search_term} {year} ({km:,} km)")
 
-        tolerances = [(2, 50_000), (3, 80_000), (5, 120_000)]
+        tolerances = [(2, 50_000), (3, 80_000), (5, 120_000), (10, 200_000)]
         
         for year_tol, km_tol in tolerances:
             matches = [
@@ -451,20 +451,17 @@ class MarketValueCalculator:
                 and abs(p['km'] - km) <= km_tol
             ]
             
-            logger.debug(f"  Tolerantie ±{year_tol}j/±{km_tol}km: {len(matches)} matches")
-            
             if len(matches) >= MIN_COMPARISON_SAMPLES:
                 value = statistics.median(matches)
                 logger.info(
-                    f"💰 Marktwaarde {search_term} {year}: €{value:.0f} "
-                    f"({len(matches)} matches, ±{year_tol}j/±{km_tol}km)"
+                    f"💰 Marktwaarde: €{value:.0f} ({len(matches)} matches, ±{year_tol}j/±{km_tol}km)"
                 )
                 return value, False
 
         # Fallback
         priced = [p for p in pool if p['price'] is not None]
-        if len(priced) < MIN_COMPARISON_SAMPLES:
-            logger.warning(f"⚠️  Te weinig data ({len(priced)}) voor {search_term} {year}")
+        if len(priced) < 3:
+            logger.warning(f"⚠️  Te weinig data ({len(priced)}) voor marktwaarde")
             return None, False
 
         base_median = statistics.median([p['price'] for p in priced])
@@ -479,7 +476,7 @@ class MarketValueCalculator:
         else:
             estimate = base_median
 
-        logger.info(f"💰 Marktwaarde {search_term} {year} (SCHATTING): €{estimate:.0f}")
+        logger.info(f"💰 Marktwaarde SCHATTING: €{estimate:.0f} ({len(priced)} auto's)")
 
         return estimate, True
 
@@ -506,7 +503,6 @@ class MarketAnalysis:
     ) -> 'MarketAnalysis':
 
         if not market_value:
-            logger.debug(f"  ❌ Geen marktwaarde beschikbaar")
             return cls(
                 asking_price=asking_price,
                 market_value=None,
@@ -521,14 +517,11 @@ class MarketAnalysis:
         elif asking_price < 5000:
             cost_factor = 0.92
         else:
-            cost_factor = 0.90
+            cost_factor = 0.88
 
         sell_price = market_value * cost_factor
         profit = int(sell_price - asking_price)
         profit_pct = (profit / asking_price * 100) if asking_price > 0 else 0
-
-        logger.debug(f"  💰 Winst analyse: €{asking_price} → €{sell_price:.0f} = €{profit} winst ({profit_pct:.0f}%)")
-        logger.debug(f"  🎯 Min. winst: €{min_profit}, Behaald: €{profit}, Profitable: {profit >= min_profit}")
 
         return cls(
             asking_price=asking_price,
@@ -616,7 +609,7 @@ class Listing:
             r'ruimte\s+nodig',
             r'heden',
             r'spoedverkoop',
-            r'direct\s+op',
+            r'direct',
             r'vanavond',
         ]
         text = f"{self.title} {self.description}".lower()
@@ -625,25 +618,20 @@ class Listing:
     async def _try_rdw_check(self, rdw_client: RDWClient, client: 'SmartClient') -> None:
         kenteken = extract_kenteken(f"{self.title} {self.description}")
         if not kenteken:
-            logger.debug(f"  🔍 Geen kenteken gevonden")
             return
 
         self.kenteken = kenteken
         rdw_info = await rdw_client.lookup(kenteken, client)
 
         if not rdw_info:
-            logger.debug(f"  ❌ RDW info niet gevonden voor {kenteken}")
             return
 
         self.rdw_verified = True
-        logger.debug(f"  ✅ RDW verificatie OK voor {kenteken}")
 
         rdw_date = rdw_info.get('datum_eerste_toelating')
         if rdw_date and len(str(rdw_date)) >= 4:
             try:
-                old_year = self.year
                 self.year = int(str(rdw_date)[:4])
-                logger.debug(f"  📅 Jaar via RDW: {old_year} → {self.year}")
             except ValueError:
                 pass
 
@@ -663,68 +651,54 @@ class Listing:
         client: 'SmartClient'
     ) -> None:
 
-        logger.debug(f"\n{'='*60}")
-        logger.debug(f"🔍 ANALYSE: {self.title[:50]}...")
-        logger.debug(f"  💶 Prijs: €{self.price:,}")
-        logger.debug(f"  📏 KM: {self.km:,}" if self.km else "  📏 KM: onbekend")
-        logger.debug(f"  📅 Jaar: {self.year}" if self.year else "  📅 Jaar: onbekend")
+        logger.info(f"\n🔍 ANALYSEER: {self.title[:50]}...")
+        logger.info(f"   💶 €{self.price:,} | {self.km:,} km" if self.km else f"   💶 €{self.price:,} | ? km")
 
         combined_text = f"{self.title} {self.description}".lower()
 
-        # ✅ AANGEPAST: Meer specifieke dealer check
+        # Dealer check - VEEL MINDER STRIKT
         dealer_matches = [word for word in filter_config.dealer_words if word in combined_text]
-        dealer_count = len(dealer_matches)
-        self.is_dealer = dealer_count >= 3  # ← GEWIJZIGD: van 2 naar 3
-        
-        logger.debug(f"  🏢 Dealer check: {dealer_count} matches {dealer_matches[:3]}")
-        logger.debug(f"  🏢 Is dealer: {self.is_dealer}")
+        self.is_dealer = len(dealer_matches) >= 4  # ZEER STRIKT NU
         
         self.motivated_seller = any(word in combined_text for word in filter_config.motivation_words)
         
         red_flag_matches = [flag for flag in filter_config.red_flags if flag in combined_text]
         self.has_red_flags = len(red_flag_matches) > 0
         
-        logger.debug(f"  🚩 Red flags: {red_flag_matches[:3] if red_flag_matches else 'geen'}")
-        logger.debug(f"  😊 Gemotiveerd: {self.motivated_seller}")
-        
         self.is_urgent = self.detect_urgency()
-        logger.debug(f"  🚨 Urgent: {self.is_urgent}")
 
         self.quality_score = sum(
             1 for indicator in filter_config.quality_indicators
             if indicator in combined_text
         )
-        logger.debug(f"  ⭐ Kwaliteit score: {self.quality_score}/10")
 
         if self.is_dealer:
-            logger.debug(f"  ❌ GEBLOKKEERD: Dealer")
+            logger.info(f"   ❌ BLOKKADE: Dealer")
             self.deal_quality = DealQuality.POOR
             return
             
         if self.has_red_flags:
-            logger.debug(f"  ❌ GEBLOKKEERD: Red flags")
+            logger.info(f"   ❌ BLOKKADE: Red flags")
             self.deal_quality = DealQuality.POOR
             return
 
         await self._try_rdw_check(rdw_client, client)
 
-        # ✅ AANGEPAST: Verbeterde data validatie
+        # VEEL SOEPELER CRITERIA!
         if self.year and self.km and self.brand and self.model:
-            logger.debug(f"  ✅ Volledige data aanwezig")
             
             if self.km > settings.max_km:
-                logger.debug(f"  ❌ GEBLOKKEERD: KM te hoog ({self.km:,} > {settings.max_km:,})")
+                logger.info(f"   ❌ BLOKKADE: KM te hoog")
                 self.deal_quality = DealQuality.POOR
                 return
 
             price_per_km = self.price / self.km
             if price_per_km > settings.price_per_km_limit:
-                logger.debug(f"  ❌ GEBLOKKEERD: €/km te hoog (€{price_per_km:.2f} > €{settings.price_per_km_limit})")
+                logger.info(f"   ❌ BLOKKADE: €/km te hoog (€{price_per_km:.2f})")
                 self.deal_quality = DealQuality.POOR
                 return
 
             search_term = self.search_term or (self.model.lower() if self.model else "")
-            logger.debug(f"  🔎 Zoekterm voor marktwaarde: '{search_term}'")
 
             market_value, is_estimated = await market_calculator.get_market_value(
                 search_term,
@@ -736,8 +710,7 @@ class Listing:
 
             adjusted_min_profit = settings.min_profit_margin
             if self.is_urgent:
-                adjusted_min_profit = int(settings.min_profit_margin * 0.7)
-                logger.debug(f"  🚨 Urgentie: winstdrempel €{settings.min_profit_margin} → €{adjusted_min_profit}")
+                adjusted_min_profit = int(settings.min_profit_margin * 0.5)
 
             self.market_analysis = MarketAnalysis.analyze(
                 self.price,
@@ -748,21 +721,20 @@ class Listing:
 
             if not self.market_analysis.is_profitable:
                 profit = self.market_analysis.profit_potential or 0
-                shortage = adjusted_min_profit - profit
                 
-                logger.debug(f"  💔 Niet winstgevend: €{profit} < €{adjusted_min_profit}")
+                # VEEL MEER WATCHLIST DEALS!
+                logger.info(f"   💔 Niet winstgevend: €{profit} < €{adjusted_min_profit}")
                 
-                if 0 <= shortage <= 200:
-                    logger.debug(f"  👀 WATCHLIST: €{shortage} tekort")
+                if profit > 0:
                     self.deal_quality = DealQuality.WATCHLIST
+                    logger.info(f"   👀 WATCHLIST: €{profit} winst")
                     return
                 
-                logger.debug(f"  ❌ GEBLOKKEERD: Te weinig winst")
                 self.deal_quality = DealQuality.POOR
                 return
 
             profit = self.market_analysis.profit_potential or 0
-            logger.debug(f"  ✅ Winstgevend: €{profit}")
+            logger.info(f"   ✅ WINSTGEVEND: €{profit}")
 
             if profit >= 1500:
                 self.deal_quality = DealQuality.GODLIKE
@@ -770,40 +742,32 @@ class Listing:
                 self.deal_quality = DealQuality.EXCELLENT
             elif profit >= 400:
                 self.deal_quality = DealQuality.GOOD
-            elif profit >= 150:
-                self.deal_quality = DealQuality.AVERAGE
             else:
-                self.deal_quality = DealQuality.POOR
-                
-            logger.debug(f"  🎯 Deal quality: {self.deal_quality.value}")
+                self.deal_quality = DealQuality.AVERAGE
                 
         else:
-            # ✅ AANGEPAST: Betere fallback logica
-            logger.debug(f"  ⚠️  Incomplete data (jaar={self.year}, km={self.km}, brand={self.brand}, model={self.model})")
+            # VEEL MINDER DATA NODIG!
+            logger.info(f"   ⚠️  Incomplete: jaar={self.year}, km={self.km}")
             
-            # Extreem lage prijs - altijd interessant
-            if self.price < 800:
-                logger.debug(f"  ✅ Extreem lage prijs: €{self.price}")
-                self.deal_quality = DealQuality.AVERAGE
-                return
-            
-            # Zeer lage €/km (maar alleen als KM bekend is)
-            if self.km and self.price / self.km < 0.10:
-                logger.debug(f"  ✅ Extreem lage €/km: €{self.price/self.km:.2f}")
-                self.deal_quality = DealQuality.AVERAGE
-                return
-            
-            # Gemotiveerde verkoper zonder veel data?
-            if self.motivated_seller and self.price < 5000:
-                logger.debug(f"  ✅ Gemotiveerde verkoper + lage prijs")
+            # Alles onder €1500 is interessant
+            if self.price < 1500:
+                logger.info(f"   ✅ WATCHLIST: Extreem lage prijs")
                 self.deal_quality = DealQuality.WATCHLIST
                 return
             
-            # Anders: te incomplete
-            logger.debug(f"  ❌ GEBLOKKEERD: Incomplete data + geen deal conditions")
-            self.deal_quality = DealQuality.POOR
+            # Lage €/km (als bekend)
+            if self.km and self.price / self.km < 0.12:
+                logger.info(f"   ✅ WATCHLIST: Lage €/km (€{self.price/self.km:.2f})")
+                self.deal_quality = DealQuality.WATCHLIST
+                return
+            
+            # Gemotiveerde verkoper
+            if self.motivated_seller and self.price < 3000:
+                logger.info(f"   ✅ WATCHLIST: Gemotiveerde verkoper")
+                self.deal_quality = DealQuality.WATCHLIST
+                return
 
-        logger.debug(f"{'='*60}\n")
+        logger.info(f"{'='*50}\n")
 
     @property
     def is_good_deal(self) -> bool:
@@ -829,17 +793,17 @@ class Listing:
 
         urgency = ""
         if self.is_urgent:
-            urgency = "\n🚨 URGENTE VERKOOP - DIRECT ACTIE!"
+            urgency = "\n🚨 URGENTE VERKOOP!"
         elif self.motivated_seller:
             urgency = "\n🚨 GEMOTIVEERDE VERKOPER!"
         
         if self.price_drop:
-            urgency += f"\n💸 PRIJS GEDAALD met €{self.price_drop}!"
+            urgency += f"\n💸 PRIJS GEDAALD: €{self.price_drop}"
 
         rdw_badge = "\n🪪 RDW geverifieerd ✅" if self.rdw_verified else ""
 
         quality_stars = "⭐" * min(self.quality_score, 5)
-        quality_info = f"\n{quality_stars} Kwaliteit: {self.quality_score}/10" if self.quality_score > 0 else ""
+        quality_info = f"\n{quality_stars}" if self.quality_score > 0 else ""
 
         market_info = ""
         if self.market_analysis and self.market_analysis.market_value:
@@ -849,50 +813,37 @@ class Listing:
 
             estimate_note = ""
             if self.market_analysis.is_estimated:
-                estimate_note = "\n⚠️ Schatting (weinig vergelijkingen)"
+                estimate_note = "\n⚠️ (Schatting)"
 
             if self.price < 2000:
                 cost_pct = 5
             elif self.price < 5000:
                 cost_pct = 8
             else:
-                cost_pct = 10
+                cost_pct = 12
 
             market_info = (
-                f"\n\n💰 WINST ANALYSE:\n"
-                f"├─ Vraagprijs: €{self.price:,}\n"
-                f"├─ Marktwaarde: €{market_val:,.0f}\n"
-                f"├─ Verkoopprijs*: €{market_val * (1 - cost_pct/100):,.0f}\n"
-                f"└─ Winst: €{profit:,} ({profit_pct:.0f}%)"
-                f"{estimate_note}\n"
-                f"\n*Na {cost_pct}% kosten"
+                f"\n\n💰 WINST:\n"
+                f"Ask: €{self.price:,}\n"
+                f"Markt: €{market_val:,.0f}\n"
+                f"Winst: €{profit:,} ({profit_pct:.0f}%){estimate_note}"
             )
-        elif self.deal_quality in (DealQuality.AVERAGE, DealQuality.WATCHLIST):
-            market_info = "\n\n💡 LET OP: Incomplete data, handmatige check nodig!"
-            if self.km:
-                market_info += f"\n📊 Prijs/km: €{self.price/self.km:.2f}"
 
-        time_posted = self.timestamp.strftime("%H:%M:%S")
-        km_str = f"{self.km:,}" if self.km else "onbekend"
-        year_str = str(self.year) if self.year else "onbekend"
+        time_posted = self.timestamp.strftime("%H:%M")
+        km_str = f"{self.km:,}" if self.km else "?"
+        year_str = str(self.year) if self.year else "?"
 
         return (
-            f"{emoji} {self.deal_quality.value} DEAL!\n"
-            f"{'━' * 30}\n"
-            f"🚗 {self.title}\n"
-            f"\n📊 SPECIFICATIES:\n"
-            f"├─ Merk: {self.brand or '?'} {self.model or ''}\n"
-            f"├─ Bouwjaar: {year_str}\n"
-            f"├─ KM-stand: {km_str}\n"
-            f"└─ Gevonden: {time_posted}"
+            f"{emoji} {self.deal_quality.value}\n"
+            f"{'━' * 35}\n"
+            f"{self.title}\n"
+            f"\n{self.brand or '?'} {self.model or '?'} | {year_str} | {km_str}km"
             f"{rdw_badge}"
             f"{market_info}"
             f"{quality_info}"
             f"{urgency}\n"
-            f"{'━' * 30}\n"
-            f"🔗 {self.url}\n\n"
-            f"⚡ ACTIE: Screenshot + Direct Bellen!\n"
-            f"💡 TIP: Bied €{max(self.price - 200, int(self.price * 0.9)):,}"
+            f"{'━' * 35}\n"
+            f"{self.url}\n"
         )
 
 # ---------------------------------------------------------
@@ -992,8 +943,8 @@ class SmartClient:
         async with lock:
             if domain in self._domain_delays:
                 elapsed = (datetime.now() - self._domain_delays[domain]).total_seconds()
-                if elapsed < 2.5:
-                    await asyncio.sleep(2.5 - elapsed)
+                if elapsed < 2.0:
+                    await asyncio.sleep(2.0 - elapsed)
             self._domain_delays[domain] = datetime.now()
 
     async def __aenter__(self):
@@ -1020,7 +971,6 @@ class SmartClient:
         block_until = self._domain_block_until.get(domain)
         if block_until and datetime.now() < block_until:
             wait = (block_until - datetime.now()).total_seconds()
-            logger.debug(f"⏳ {domain} in cooldown, wacht {wait:.0f}s")
             await asyncio.sleep(wait)
 
         await self._rate_limit(url)
@@ -1040,15 +990,15 @@ class SmartClient:
                         "Upgrade-Insecure-Requests": "1",
                     }
 
-                    async with self._session.get(url, headers=headers) as response:
+                    async with self._session.get(url, headers=headers, ssl=False) as response:
                         if response.status == 200:
                             self._domain_block_until.pop(domain, None)
                             return await response.text()
                         elif response.status == 403:
                             self._stats["blocked"] += 1
-                            wait = min(2 ** attempt * 3, 30)
+                            wait = min(2 ** attempt * 3, 60)
                             self._domain_block_until[domain] = datetime.now() + timedelta(seconds=wait)
-                            logger.warning(f"🚫 Blocked ({domain}), wacht {wait}s")
+                            logger.warning(f"🚫 Blocked, wacht {wait}s...")
                             await asyncio.sleep(wait)
                         elif response.status in (429, 503):
                             wait = 2 ** attempt
@@ -1056,12 +1006,10 @@ class SmartClient:
                         elif response.status == 404:
                             return None
                         else:
-                            logger.debug(f"❌ HTTP {response.status} voor {url}")
                             return None
 
                 except Exception as e:
                     self._stats["errors"] += 1
-                    logger.debug(f"❌ Request error (poging {attempt}): {e}")
                     if attempt < self.config.max_retries:
                         await asyncio.sleep(2 ** attempt)
 
@@ -1100,17 +1048,15 @@ class ListingParser:
                     if price > PRICE_CENT_THRESHOLD:
                         price = price // 100
                     
-                    logger.debug(f"  ✅ Parse OK: {title[:40]}... - €{price}")
                     return title, price, description
 
             except Exception as e:
-                logger.debug(f"  ⚠️  JSON parse failed: {e}")
+                pass
 
         title_match = re.search(r'<title>(.*?)</title>', html)
         price_match = re.search(r'"price(?:Cents)?"\s*:\s*"?(\d+)"?', html)
 
         if not title_match or not price_match:
-            logger.debug(f"  ❌ Geen titel/prijs gevonden in HTML")
             return None, None, ""
 
         title = title_match.group(1).strip()
@@ -1122,12 +1068,10 @@ class ListingParser:
         if price > PRICE_CENT_THRESHOLD:
             price = price // 100
 
-        logger.debug(f"  ✅ Regex parse: {title[:40]}... - €{price}")
         return title, price, ""
 
     @staticmethod
     def extract_km(text: str) -> Optional[int]:
-        # ✅ AANGEPAST: Betere KM extractie
         patterns = [
             r'(\d{1,3}(?:[.,\s]\d{3})*)\s*km\b',
             r'km[:\s]*(\d{1,3}(?:[.,\s]\d{3})*)',
@@ -1140,8 +1084,7 @@ class ListingParser:
                 raw = re.sub(r'[.,\s]', '', match.group(1))
                 try:
                     km = int(raw)
-                    if 50 < km < 500_000:  # ✅ AANGEPAST: van 100 naar 50
-                        logger.debug(f"  📏 KM extracted: {km:,}")
+                    if 50 < km < 500_000:
                         return km
                 except ValueError:
                     continue
@@ -1159,9 +1102,7 @@ class ListingParser:
             r'bj\.?\s*(\d{4})',
             r'van\s+(\d{4})',
             r'uit\s+(\d{4})',
-            r'kenteken\s+(\d{4})',
             r'(\d{4})\s*-\s*heden',
-            r'(\d{4})\s*-\s*nu',
         ]
 
         for pattern in specific_patterns:
@@ -1170,7 +1111,6 @@ class ListingParser:
                 try:
                     year = int(match.group(1))
                     if 1990 <= year <= current_year:
-                        logger.debug(f"  📅 Jaar extracted (pattern): {year}")
                         return year
                 except ValueError:
                     continue
@@ -1182,17 +1122,9 @@ class ListingParser:
             if valid:
                 counts = Counter(valid)
                 year = counts.most_common(1)[0][0]
-                logger.debug(f"  📅 Jaar extracted (fallback): {year}")
                 return year
 
         return None
-
-    @staticmethod
-    def extract_listing_links(html: str) -> List[str]:
-        pattern = r'href="(/v/auto-s/[^"#?]+)"'
-        links = re.findall(pattern, html)
-        unique_links = list(dict.fromkeys(links))
-        return [f"https://www.marktplaats.nl{link}" for link in unique_links]
 
 # ---------------------------------------------------------
 # RSS MONITOR
@@ -1207,14 +1139,12 @@ class MarktplaatsRSSMonitor:
     async def check_rss(self, model: str, client: SmartClient) -> List[str]:
         rss_url = (
             f"https://www.marktplaats.nl/lrp/api/search?"
-            f"query={model}&searchInTitleAndDescription=true&limit=50"
+            f"query={model}&searchInTitleAndDescription=true&limit=100"
         )
 
-        logger.debug(f"🔍 RSS fetch voor '{model}'")
         data = await client.get_html(rss_url)
         
         if not data:
-            logger.warning(f"❌ Geen RSS data voor '{model}'")
             return []
 
         new_listings = []
@@ -1222,8 +1152,7 @@ class MarktplaatsRSSMonitor:
         try:
             json_data = json.loads(data)
             listings = json_data.get('listings', [])
-            
-            logger.debug(f"  📊 {len(listings)} listings in RSS feed")
+            logger.info(f"📡 {model}: {len(listings)} listings")
 
             for listing in listings:
                 listing_id = listing.get('itemId')
@@ -1235,13 +1164,12 @@ class MarktplaatsRSSMonitor:
                     if vip_url:
                         new_listings.append(f"https://www.marktplaats.nl{vip_url}")
 
-            if len(self._seen_items) > 2000:
-                self._seen_items = set(list(self._seen_items)[-1000:])
+            if len(self._seen_items) > 5000:
+                self._seen_items = set(list(self._seen_items)[-2500:])
 
         except Exception as e:
-            logger.error(f"❌ RSS parse error voor '{model}': {e}")
+            logger.error(f"RSS parse error: {e}")
 
-        logger.debug(f"  ✅ {len(new_listings)} nieuwe listings voor '{model}'")
         return new_listings
 
 # ---------------------------------------------------------
@@ -1255,8 +1183,8 @@ class ProfitScraper:
         filter_config: FilterConfig,
         seen_manager: SeenLinksManager,
         settings: RuntimeSettings,
-        market_samples: int = 50,
-        market_pool_ttl_hours: int = 4,
+        market_samples: int = 100,
+        market_pool_ttl_hours: int = 2,
     ):
         self.filter_config = filter_config
         self.seen_manager = seen_manager
@@ -1275,12 +1203,6 @@ class ProfitScraper:
             'deals_found': 0,
             'urgent_deals': 0,
             'watchlist_deals': 0,
-            'blocked_dealer': 0,
-            'blocked_red_flags': 0,
-            'blocked_km': 0,
-            'blocked_price_km': 0,
-            'blocked_no_profit': 0,
-            'blocked_incomplete': 0,
         }
 
         self.found_deals: List[Listing] = []
@@ -1293,21 +1215,17 @@ class ProfitScraper:
     ) -> Optional[Listing]:
 
         if await self.seen_manager.contains(url):
-            logger.debug(f"⏭️  Skip (already seen): {url}")
             return None
 
-        logger.debug(f"📄 Processing: {url}")
         html = await client.get_html(url)
         
         if not html:
-            logger.debug(f"  ❌ Geen HTML opgehaald")
             await self.seen_manager.add(url)
             return None
 
         title, price, description = ListingParser.parse_marktplaats_json(html)
         
         if not title or not price:
-            logger.debug(f"  ❌ Geen titel/prijs")
             await self.seen_manager.add(url)
             return None
 
@@ -1345,20 +1263,12 @@ class ProfitScraper:
             )
 
         except ValueError as e:
-            logger.warning(f"  ❌ Invalid listing: {e}")
             await self.seen_manager.add(url)
             return None
 
         self._stats['listings_checked'] += 1
 
-        # Track waarom dingen worden geblokkeerd
-        if listing.is_dealer:
-            self._stats['blocked_dealer'] += 1
-        if listing.has_red_flags:
-            self._stats['blocked_red_flags'] += 1
-
         if not listing.is_good_deal:
-            logger.debug(f"  ❌ Geen goede deal (quality={listing.deal_quality.value})")
             await self.seen_manager.add(url)
             return None
 
@@ -1380,7 +1290,7 @@ class ProfitScraper:
 
         logger.info(
             f"🎉 DEAL GEVONDEN: {listing.deal_quality.value} | "
-            f"€{profit} winst | {listing.brand} {listing.model} {listing.year}"
+            f"€{profit} winst | {listing.brand} {listing.model}"
         )
 
         return listing
@@ -1388,9 +1298,6 @@ class ProfitScraper:
     async def scan_model(self, model: str, client: SmartClient) -> List[Listing]:
 
         new_links = await self.rss_monitor.check_rss(model, client)
-
-        if new_links:
-            logger.info(f"📡 {model}: {len(new_links)} nieuwe listings")
 
         if not new_links:
             return []
@@ -1407,7 +1314,7 @@ class ProfitScraper:
         
         logger.info(f"\n{'='*60}")
         logger.info(f"🚀 SCAN #{self._stats['scans']} GESTART")
-        logger.info(f"{'='*60}\n")
+        logger.info(f"{'='*60}")
 
         all_search_terms = []
         for model in self.filter_config.models:
@@ -1415,7 +1322,7 @@ class ProfitScraper:
             aliases = self.filter_config.model_aliases.get(model, [])
             all_search_terms.extend(aliases)
 
-        logger.info(f"🔎 Zoektermen: {', '.join(all_search_terms)}")
+        logger.info(f"🔎 Zoeken naar: {len(all_search_terms)} termen")
 
         tasks = [
             self.scan_model(term, client)
@@ -1427,13 +1334,12 @@ class ProfitScraper:
 
         logger.info(f"\n{'='*60}")
         logger.info(
-            f"✅ SCAN COMPLEET: {len(all_deals)} deals | "
-            f"{self._stats['listings_checked']} bekeken | "
-            f"{self._stats['urgent_deals']} urgent"
+            f"✅ SCAN COMPLEET\n"
+            f"   📊 {self._stats['listings_checked']} bekeken\n"
+            f"   💰 {self._stats['deals_found']} deals\n"
+            f"   🚨 {self._stats['urgent_deals']} urgent\n"
+            f"   👀 {self._stats['watchlist_deals']} watchlist"
         )
-        logger.info(f"📊 BLOKKADES:")
-        logger.info(f"  - Dealers: {self._stats['blocked_dealer']}")
-        logger.info(f"  - Red flags: {self._stats['blocked_red_flags']}")
         logger.info(f"{'='*60}\n")
 
         self.price_tracker.cleanup_old()
@@ -1465,17 +1371,16 @@ class TelegramNotifier:
 
     async def send_message(self, message: str) -> bool:
         try:
-            logger.debug(f"📤 Verstuur Telegram bericht ({len(message)} chars)")
             await self.app.bot.send_message(
                 chat_id=self.chat_id,
                 text=message,
                 disable_web_page_preview=True,
             )
             self._stats["sent"] += 1
-            logger.info(f"✅ Telegram bericht verstuurd")
+            logger.info(f"📤 Telegram message verzonden")
             return True
         except Exception as e:
-            logger.error(f"❌ Telegram error: {e}", exc_info=True)
+            logger.error(f"Telegram error: {e}")
             return False
 
     async def send_listing(self, listing: Listing) -> bool:
@@ -1483,13 +1388,11 @@ class TelegramNotifier:
 
     async def send_startup(self, min_profit: int) -> bool:
         message = (
-            "💰 PROFIT BOT ACTIEF (DEBUG MODE)\n\n"
+            "💰 PROFIT BOT ACTIEF\n\n"
             f"📅 {datetime.now(ZoneInfo('Europe/Amsterdam')).strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"🎯 Min. winst: €{min_profit}\n"
-            "✅ Monitoring gestart\n\n"
-            "🔍 DEBUG LOGGING ACTIEF"
+            f"🎯 Winst: €{min_profit}+\n"
+            "✅ Monitoring gestart"
         )
-        logger.info("📤 Verstuur startup bericht")
         return await self.send_message(message)
 
 # ---------------------------------------------------------
@@ -1512,68 +1415,37 @@ class BotCommands:
 
     def _is_authorized(self, update) -> bool:
         user_id = str(update.effective_chat.id)
-        authorized = user_id == str(self.bot_config.telegram_chat_id)
-        
-        logger.debug(f"🔐 Auth check: user={user_id}, expected={self.bot_config.telegram_chat_id}, authorized={authorized}")
-        
-        return authorized
+        return user_id == str(self.bot_config.telegram_chat_id)
 
     async def start(self, update, context):
-        logger.info(f"📨 /start command ontvangen van {update.effective_chat.id}")
-        
         if not self._is_authorized(update):
-            logger.warning(f"⛔ Ongeautoriseerde toegang geweigerd")
             return
 
         welcome = (
-            "🚀 *Welkom bij Auto Profit Bot (DEBUG)*\n\n"
-            "Ik scan 24/7 Marktplaats voor deals.\n\n"
+            "🚀 *Auto Profit Bot*\n\n"
+            "Ik scan Marktplaats 24/7 voor deals.\n\n"
             "✅ Marktwaarde analyse\n"
             "✅ Urgentie detectie\n"
             "✅ Prijsdaling tracking\n\n"
-            "🔍 DEBUG MODE ACTIEF\n"
-            "Bekijk bot.log voor details\n\n"
-            "Gebruik /help voor meer info."
+            "Gebruik /help voor commands"
         )
         await update.message.reply_text(welcome, parse_mode='Markdown')
-        logger.info("✅ Start bericht verstuurd")
 
     async def help(self, update, context):
-        logger.info(f"📨 /help command ontvangen")
-        
         if not self._is_authorized(update):
             return
 
         help_text = (
             "❓ *Commands:*\n\n"
-            "/stats - Statistieken\n"
-            "/top - Beste deals\n"
-            "/settings - Instellingen\n"
-            "/pause - Pauzeren\n"
-            "/resume - Hervatten\n"
-            "/test - Test Telegram verbinding"
+            "/stats - Bot statistieken\n"
+            "/top - Top 5 deals\n"
+            "/pause - Bot pauzeren\n"
+            "/resume - Bot hervatten\n"
+            "/settings - Instellingen"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
-    async def test(self, update, context):
-        """Test command"""
-        logger.info(f"📨 /test command ontvangen")
-        
-        if not self._is_authorized(update):
-            return
-        
-        test_msg = (
-            "✅ TELEGRAM WERKT!\n\n"
-            f"Chat ID: {update.effective_chat.id}\n"
-            f"Tijd: {datetime.now(ZoneInfo('Europe/Amsterdam')).strftime('%H:%M:%S')}\n"
-            f"Bot draait: JA"
-        )
-        await update.message.reply_text(test_msg)
-        logger.info("✅ Test bericht verstuurd")
-
     async def stats(self, update, context):
-        logger.info(f"📨 /stats command ontvangen")
-        
         if not self._is_authorized(update):
             return
 
@@ -1581,101 +1453,35 @@ class BotCommands:
         status = "⏸️ GEPAUZEERD" if self.settings.paused else "▶️ ACTIEF"
 
         stats_text = (
-            "📊 *Bot Statistieken (DEBUG)*\n\n"
+            f"📊 *Statistieken*\n\n"
             f"Status: {status}\n\n"
             f"🔍 Scans: {stats['scans']}\n"
             f"📋 Bekeken: {stats['listings_checked']}\n"
             f"💰 Deals: {stats['deals_found']}\n"
             f"🚨 Urgent: {stats['urgent_deals']}\n"
             f"👀 Watchlist: {stats['watchlist_deals']}\n\n"
-            f"❌ BLOKKADES:\n"
-            f"Dealers: {stats['blocked_dealer']}\n"
-            f"Red flags: {stats['blocked_red_flags']}\n\n"
             f"⚡ Interval: {self.settings.check_interval}s\n"
             f"🎯 Min. winst: €{self.settings.min_profit_margin}"
         )
         await update.message.reply_text(stats_text, parse_mode='Markdown')
 
     async def pause(self, update, context):
-        logger.info(f"📨 /pause command ontvangen")
-        
         if not self._is_authorized(update):
             return
 
         self.settings.paused = True
         save_runtime_settings(self.settings)
         await update.message.reply_text("⏸️ Bot gepauzeerd")
-        logger.info("⏸️ Bot gepauzeerd")
 
     async def resume(self, update, context):
-        logger.info(f"📨 /resume command ontvangen")
-        
         if not self._is_authorized(update):
             return
 
         self.settings.paused = False
         save_runtime_settings(self.settings)
         await update.message.reply_text("▶️ Bot hervat")
-        logger.info("▶️ Bot hervat")
-
-    async def settings_cmd(self, update, context):
-        logger.info(f"📨 /settings command ontvangen")
-        
-        if not self._is_authorized(update):
-            return
-
-        args = context.args
-
-        if not args:
-            text = (
-                "⚙️ *Instellingen*\n\n"
-                f"🎯 Min. winst: €{self.settings.min_profit_margin}\n"
-                f"🛣️ Max. KM: {self.settings.max_km:,}\n"
-                f"💶 Max €/km: {self.settings.price_per_km_limit}\n"
-                f"⏱️ Interval: {self.settings.check_interval}s\n\n"
-                "*Wijzigen:*\n"
-                "/settings minprofit <bedrag>\n"
-                "/settings maxkm <km>\n"
-                "/settings interval <sec>"
-            )
-            await update.message.reply_text(text, parse_mode='Markdown')
-            return
-
-        if len(args) < 2:
-            await update.message.reply_text("⚠️ Gebruik: /settings <optie> <waarde>")
-            return
-
-        option = args[0].lower()
-        value_raw = args[1]
-
-        try:
-            if option == "minprofit":
-                value = int(value_raw)
-                self.settings.min_profit_margin = value
-                save_runtime_settings(self.settings)
-                await update.message.reply_text(f"✅ Min. winst: €{value}")
-                logger.info(f"⚙️  Min profit aangepast naar €{value}")
-
-            elif option == "maxkm":
-                value = int(value_raw)
-                self.settings.max_km = value
-                save_runtime_settings(self.settings)
-                await update.message.reply_text(f"✅ Max. KM: {value:,}")
-
-            elif option == "interval":
-                value = int(value_raw)
-                self.settings.check_interval = value
-                save_runtime_settings(self.settings)
-                await update.message.reply_text(f"✅ Interval: {value}s")
-                
-            else:
-                await update.message.reply_text("⚠️ Opties: minprofit, maxkm, interval")
-        except ValueError:
-            await update.message.reply_text("⚠️ Ongeldige waarde")
 
     async def top(self, update, context):
-        logger.info(f"📨 /top command ontvangen")
-        
         if not self._is_authorized(update):
             return
 
@@ -1688,24 +1494,19 @@ class BotCommands:
         lines = ["🏆 *Top 5 deals:*\n"]
         for i, deal in enumerate(top_deals, start=1):
             profit = deal.market_analysis.profit_potential if deal.market_analysis else 0
-            urgent = " 🚨" if deal.is_urgent else ""
             lines.append(
-                f"{i}. {deal.deal_quality.value}{urgent}\n"
-                f"   {deal.brand} {deal.model} {deal.year}\n"
-                f"   €{deal.price:,} → €{profit:,}\n"
+                f"{i}. {deal.deal_quality.value}\n"
+                f"   €{profit:,} | {deal.brand} {deal.model}\n\n"
             )
 
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode='Markdown',
-        )
+        await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 # ---------------------------------------------------------
 # TELEGRAM ERROR HANDLER
 # ---------------------------------------------------------
 
 async def telegram_error_handler(update, context):
-    logger.error(f"❌ Telegram error: {context.error}", exc_info=context.error)
+    logger.error(f"Telegram error: {context.error}")
 
 # ---------------------------------------------------------
 # MAIN BOT
@@ -1732,7 +1533,7 @@ class ProfitBot:
 
     def _setup_signals(self):
         def handle(signum, frame):
-            logger.info(f"🛑 Shutdown signal: {signal.Signals(signum).name}")
+            logger.info(f"🛑 Shutdown signal")
             self._shutdown.set()
 
         signal.signal(signal.SIGTERM, handle)
@@ -1745,21 +1546,18 @@ class ProfitBot:
         async with SmartClient(self.bot_config) as client:
             while not self._shutdown.is_set():
 
-                if self.settings.paused:
-                    logger.info("⏸️ Gepauzeerd")
-                else:
+                if not self.settings.paused:
                     try:
                         deals = await self.scraper.scan_all(client)
 
-                        logger.info(f"📤 Verstuur {len(deals)} deals naar Telegram")
                         for deal in deals:
                             await self.notifier.send_listing(deal)
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(0.5)
 
                         await self.seen_manager.cleanup_and_save()
 
                     except Exception as e:
-                        logger.exception(f"❌ Scan error: {e}")
+                        logger.exception(f"Scan error: {e}")
 
                 try:
                     await asyncio.wait_for(
@@ -1773,7 +1571,7 @@ class ProfitBot:
         logger.info("🛑 Bot gestopt")
 
     async def _post_init(self, app):
-        logger.info("🔧 Post-init gestart")
+        logger.info("🔧 Bot initializing...")
         
         self.notifier = TelegramNotifier(app, self.bot_config.telegram_chat_id)
         self.scraper = ProfitScraper(
@@ -1788,28 +1586,25 @@ class ProfitBot:
         
         app.add_handler(CommandHandler("start", commands.start))
         app.add_handler(CommandHandler("help", commands.help))
-        app.add_handler(CommandHandler("test", commands.test))
         app.add_handler(CommandHandler("stats", commands.stats))
         app.add_handler(CommandHandler("pause", commands.pause))
         app.add_handler(CommandHandler("resume", commands.resume))
-        app.add_handler(CommandHandler("settings", commands.settings_cmd))
         app.add_handler(CommandHandler("top", commands.top))
         app.add_error_handler(telegram_error_handler)
 
-        logger.info("✅ Handlers geregistreerd")
+        logger.info("✅ Bot ready")
         
         asyncio.create_task(self._scan_loop())
-        logger.info("✅ Scan loop task gestart")
 
     async def _post_shutdown(self, app):
-        logger.info("🔧 Post-shutdown")
+        logger.info("Shutdown...")
         await self.seen_manager.cleanup_and_save()
 
     def run(self):
         logger.info("="*60)
-        logger.info("💰 PROFIT BOT START (DEBUG MODE)")
-        logger.info(f"🎯 Min winst: €{self.settings.min_profit_margin}")
-        logger.info(f"📱 Chat ID: {self.bot_config.telegram_chat_id}")
+        logger.info("💰 AUTO PROFIT BOT START")
+        logger.info(f"🎯 Min. winst: €{self.settings.min_profit_margin}")
+        logger.info(f"📱 Chat: {self.bot_config.telegram_chat_id}")
         logger.info("="*60)
 
         try:
@@ -1821,11 +1616,11 @@ class ProfitBot:
                 .build()
             )
 
-            logger.info("🚀 Start polling...")
+            logger.info("🚀 Polling started...")
             app.run_polling(allowed_updates=None, drop_pending_updates=True)
 
         except Exception as e:
-            logger.exception(f"❌ Fatal error: {e}")
+            logger.exception(f"FATAL: {e}")
             sys.exit(1)
 
 # ---------------------------------------------------------
@@ -1834,13 +1629,13 @@ class ProfitBot:
 
 def main():
     try:
-        logger.info("🔧 Laden config...")
+        logger.info("Loading config...")
         bot_config = BotConfig.from_env()
         
-        logger.info("🔧 Laden filters...")
+        logger.info("Loading filters...")
         filter_config = FilterConfig.from_file(Path("filters.json"))
         
-        logger.info(f"✅ Config geladen: {len(filter_config.models)} modellen")
+        logger.info(f"✅ Ready: {len(filter_config.models)} modellen")
 
         atexit.register(
             notify_shutdown_sync,
@@ -1852,7 +1647,7 @@ def main():
         bot.run()
 
     except Exception as e:
-        logger.exception(f"❌ Startup error: {e}")
+        logger.exception(f"STARTUP ERROR: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
