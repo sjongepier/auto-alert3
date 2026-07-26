@@ -38,6 +38,7 @@ KENTEKEN_PATTERN = re.compile(r'\b([A-Za-z0-9]{1,3}-[A-Za-z0-9]{1,3}-[A-Za-z0-9]
 
 @dataclass(frozen=True)
 class BotConfig:
+    """Opstart-configuratie, geladen uit env vars. Onveranderlijk tijdens runtime."""
     telegram_token: str
     telegram_chat_id: str
     check_interval: int = 8
@@ -68,6 +69,21 @@ class BotConfig:
             check_interval=int(os.getenv("CHECK_INTERVAL", 8)),
             min_profit_margin=int(os.getenv("MIN_PROFIT_MARGIN", 500)),
         )
+
+
+@dataclass
+class RuntimeSettings:
+    """
+    Aanpasbare instellingen tijdens het draaien van de bot.
+    In tegenstelling tot BotConfig (frozen, alleen bij opstart) kunnen
+    deze waarden live gewijzigd worden via /settings, /pause, /resume.
+    """
+    min_profit_margin: int
+    max_km: int
+    price_per_km_limit: float
+    check_interval: int
+    paused: bool = False
+
 
 @dataclass(frozen=True)
 class FilterConfig:
@@ -462,7 +478,7 @@ class Listing:
     async def analyze(
         self,
         filter_config: FilterConfig,
-        bot_config: BotConfig,
+        settings: RuntimeSettings,
         market_calculator: MarketValueCalculator,
         rdw_client: RDWClient,
         client: 'SmartClient'
@@ -489,11 +505,11 @@ class Listing:
             self.deal_quality = DealQuality.POOR
             return
 
-        if self.km > bot_config.max_km:
+        if self.km > settings.max_km:
             self.deal_quality = DealQuality.POOR
             return
 
-        if self.price / self.km > bot_config.price_per_km_limit:
+        if self.price / self.km > settings.price_per_km_limit:
             self.deal_quality = DealQuality.POOR
             return
 
@@ -508,7 +524,7 @@ class Listing:
         self.market_analysis = MarketAnalysis.analyze(
             self.price,
             market_value,
-            bot_config.min_profit_margin
+            settings.min_profit_margin
         )
 
         if not self.market_analysis.is_profitable:
@@ -901,13 +917,13 @@ class ProfitScraper:
 
     def __init__(
         self,
-        bot_config: BotConfig,
         filter_config: FilterConfig,
         seen_manager: SeenLinksManager,
+        settings: RuntimeSettings,
     ):
-        self.bot_config = bot_config
         self.filter_config = filter_config
         self.seen_manager = seen_manager
+        self.settings = settings
         self.market_calculator = MarketValueCalculator()
         self.rdw_client = RDWClient()
         self.rss_monitor = MarktplaatsRSSMonitor(filter_config)
@@ -917,6 +933,9 @@ class ProfitScraper:
             'listings_checked': 0,
             'deals_found': 0,
         }
+
+        # Bewaar gevonden deals voor /top command (max 100, meest recente)
+        self.found_deals: List[Listing] = []
 
     async def process_listing(
         self,
@@ -953,7 +972,7 @@ class ProfitScraper:
 
             await listing.analyze(
                 self.filter_config,
-                self.bot_config,
+                self.settings,
                 self.market_calculator,
                 self.rdw_client,
                 client
@@ -972,6 +991,10 @@ class ProfitScraper:
 
         self._stats['deals_found'] += 1
         await self.seen_manager.add(url)
+
+        self.found_deals.append(listing)
+        if len(self.found_deals) > 100:
+            self.found_deals = self.found_deals[-100:]
 
         profit = listing.market_analysis.profit_potential if listing.market_analysis else 0
 
@@ -1020,6 +1043,16 @@ class ProfitScraper:
     def get_stats(self) -> Dict:
         return self._stats.copy()
 
+    def get_top_deals(self, n: int = 5) -> List[Listing]:
+        """Top N deals op basis van winstpotentieel, hoogste eerst."""
+        def profit_of(listing: Listing) -> int:
+            if listing.market_analysis and listing.market_analysis.profit_potential:
+                return listing.market_analysis.profit_potential
+            return 0
+
+        sorted_deals = sorted(self.found_deals, key=profit_of, reverse=True)
+        return sorted_deals[:n]
+
 # ---------------------------------------------------------
 # TELEGRAM NOTIFIER
 # ---------------------------------------------------------
@@ -1057,15 +1090,16 @@ class TelegramNotifier:
         return await self.send_message(message)
 
 # ---------------------------------------------------------
-# BOT COMMANDS (nu correct gedefinieerd VOOR ProfitBot)
+# BOT COMMANDS
 # ---------------------------------------------------------
 
 class BotCommands:
     """Handler voor bot commands."""
 
-    def __init__(self, notifier: TelegramNotifier, scraper: ProfitScraper):
+    def __init__(self, notifier: TelegramNotifier, scraper: ProfitScraper, settings: RuntimeSettings):
         self.notifier = notifier
         self.scraper = scraper
+        self.settings = settings
 
     async def start(self, update, context):
         welcome = (
@@ -1082,9 +1116,9 @@ class BotCommands:
     async def help(self, update, context):
         help_text = (
             "❓ *Hoe werkt de bot?*\n\n"
-            "1️⃣ Ik scan elke 8 seconden Marktplaats\n"
+            "1️⃣ Ik scan regelmatig Marktplaats\n"
             "2️⃣ Bij nieuwe auto's check ik de marktwaarde\n"
-            "3️⃣ Als winst >€500: je krijgt een alert!\n\n"
+            "3️⃣ Als winst boven de drempel zit: je krijgt een alert!\n\n"
             "📊 *Deal Categorieën:*\n"
             "💎 GODLIKE: €1000+ winst\n"
             "🔥 EXCELLENT: €500-1000 winst\n"
@@ -1093,24 +1127,126 @@ class BotCommands:
             "• Reageer binnen 5 minuten\n"
             "• Screenshot + direct bellen\n"
             "• Onderhandel altijd\n\n"
-            "Commands:\n"
+            "*Commands:*\n"
             "/stats - Bekijk statistieken\n"
+            "/top - Beste deals sinds herstart\n"
+            "/settings - Bekijk/wijzig instellingen\n"
+            "/pause - Scannen tijdelijk stoppen\n"
+            "/resume - Scannen hervatten\n"
             "/help - Deze uitleg"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
     async def stats(self, update, context):
         stats = self.scraper.get_stats()
+        status = "⏸️ GEPAUZEERD" if self.settings.paused else "▶️ ACTIEF"
 
         stats_text = (
             "📊 *Bot Statistieken*\n\n"
+            f"Status: {status}\n\n"
             f"🔍 Scans: {stats['scans']}\n"
             f"📋 Listings bekeken: {stats['listings_checked']}\n"
             f"💰 Deals gevonden: {stats['deals_found']}\n\n"
-            f"⚡ Scan interval: 8 seconden\n"
-            f"🎯 Min. winst: €500\n"
+            f"⚡ Scan interval: {self.settings.check_interval}s\n"
+            f"🎯 Min. winst: €{self.settings.min_profit_margin}\n"
         )
         await update.message.reply_text(stats_text, parse_mode='Markdown')
+
+    async def pause(self, update, context):
+        self.settings.paused = True
+        await update.message.reply_text(
+            "⏸️ Bot gepauzeerd. Er wordt niet meer gescand tot je /resume gebruikt."
+        )
+        logger.info("⏸️ Bot gepauzeerd via Telegram command")
+
+    async def resume(self, update, context):
+        self.settings.paused = False
+        await update.message.reply_text("▶️ Bot hervat, scannen gaat weer verder.")
+        logger.info("▶️ Bot hervat via Telegram command")
+
+    async def settings_cmd(self, update, context):
+        args = context.args
+
+        if not args:
+            text = (
+                "⚙️ *Huidige instellingen*\n\n"
+                f"🎯 Min. winst: €{self.settings.min_profit_margin}\n"
+                f"🛣️ Max. KM: {self.settings.max_km:,}\n"
+                f"💶 Max €/km: {self.settings.price_per_km_limit}\n"
+                f"⏱️ Scan interval: {self.settings.check_interval}s\n"
+                f"Status: {'⏸️ GEPAUZEERD' if self.settings.paused else '▶️ ACTIEF'}\n\n"
+                "*Wijzigen:*\n"
+                "/settings minprofit <bedrag>\n"
+                "/settings maxkm <km>\n"
+                "/settings pricekm <bedrag>\n"
+                "/settings interval <seconden>\n\n"
+                "_Voorbeeld: /settings minprofit 300_"
+            )
+            await update.message.reply_text(text, parse_mode='Markdown')
+            return
+
+        if len(args) < 2:
+            await update.message.reply_text(
+                "⚠️ Gebruik: /settings <optie> <waarde>\n"
+                "Bijvoorbeeld: /settings minprofit 300"
+            )
+            return
+
+        option = args[0].lower()
+        value_raw = args[1]
+
+        try:
+            if option == "minprofit":
+                self.settings.min_profit_margin = int(value_raw)
+                await update.message.reply_text(
+                    f"✅ Min. winst ingesteld op €{self.settings.min_profit_margin}"
+                )
+            elif option == "maxkm":
+                self.settings.max_km = int(value_raw)
+                await update.message.reply_text(
+                    f"✅ Max. KM ingesteld op {self.settings.max_km:,}"
+                )
+            elif option == "pricekm":
+                self.settings.price_per_km_limit = float(value_raw)
+                await update.message.reply_text(
+                    f"✅ Max €/km ingesteld op {self.settings.price_per_km_limit}"
+                )
+            elif option == "interval":
+                self.settings.check_interval = int(value_raw)
+                await update.message.reply_text(
+                    f"✅ Scan interval ingesteld op {self.settings.check_interval}s\n"
+                    f"(gaat in vanaf de volgende scan-cyclus)"
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ Onbekende optie. Gebruik: minprofit, maxkm, pricekm of interval."
+                )
+        except ValueError:
+            await update.message.reply_text("⚠️ Ongeldige waarde, gebruik een getal.")
+
+    async def top(self, update, context):
+        top_deals = self.scraper.get_top_deals(5)
+
+        if not top_deals:
+            await update.message.reply_text(
+                "📭 Nog geen deals gevonden sinds de laatste herstart."
+            )
+            return
+
+        lines = ["🏆 *Top deals sinds laatste herstart:*\n"]
+        for i, deal in enumerate(top_deals, start=1):
+            profit = deal.market_analysis.profit_potential if deal.market_analysis else 0
+            lines.append(
+                f"{i}. {deal.deal_quality.value} — {deal.brand} {deal.model} {deal.year}\n"
+                f"   €{deal.price:,} → winst €{profit:,}\n"
+                f"   {deal.url}"
+            )
+
+        await update.message.reply_text(
+            "\n\n".join(lines),
+            parse_mode='Markdown',
+            disable_web_page_preview=True
+        )
 
 # ---------------------------------------------------------
 # MAIN BOT
@@ -1121,6 +1257,13 @@ class ProfitBot:
     def __init__(self, bot_config: BotConfig, filter_config: FilterConfig):
         self.bot_config = bot_config
         self.filter_config = filter_config
+
+        self.settings = RuntimeSettings(
+            min_profit_margin=bot_config.min_profit_margin,
+            max_km=bot_config.max_km,
+            price_per_km_limit=bot_config.price_per_km_limit,
+            check_interval=bot_config.check_interval,
+        )
 
         self.seen_manager = SeenLinksManager(
             bot_config.seen_file,
@@ -1147,22 +1290,26 @@ class ProfitBot:
 
         async with SmartClient(self.bot_config) as client:
             while not self._shutdown.is_set():
-                try:
-                    deals = await self.scraper.scan_all(client)
 
-                    for deal in deals:
-                        await self.notifier.send_listing(deal)
-                        await asyncio.sleep(2)
+                if self.settings.paused:
+                    logger.info("⏸️ Gepauzeerd, sla scan over")
+                else:
+                    try:
+                        deals = await self.scraper.scan_all(client)
 
-                    await self.seen_manager.cleanup_and_save()
+                        for deal in deals:
+                            await self.notifier.send_listing(deal)
+                            await asyncio.sleep(2)
 
-                except Exception:
-                    logger.exception("Scan error")
+                        await self.seen_manager.cleanup_and_save()
+
+                    except Exception:
+                        logger.exception("Scan error")
 
                 try:
                     await asyncio.wait_for(
                         self._shutdown.wait(),
-                        timeout=self.bot_config.check_interval
+                        timeout=self.settings.check_interval
                     )
                     break
                 except asyncio.TimeoutError:
@@ -1173,16 +1320,19 @@ class ProfitBot:
     async def _post_init(self, app):
         self.notifier = TelegramNotifier(app, self.bot_config.telegram_chat_id)
         self.scraper = ProfitScraper(
-            self.bot_config,
             self.filter_config,
             self.seen_manager,
+            self.settings,
         )
 
-        # Command handlers correct geregistreerd VOORDAT polling start
-        commands = BotCommands(self.notifier, self.scraper)
+        commands = BotCommands(self.notifier, self.scraper, self.settings)
         app.add_handler(CommandHandler("start", commands.start))
         app.add_handler(CommandHandler("help", commands.help))
         app.add_handler(CommandHandler("stats", commands.stats))
+        app.add_handler(CommandHandler("pause", commands.pause))
+        app.add_handler(CommandHandler("resume", commands.resume))
+        app.add_handler(CommandHandler("settings", commands.settings_cmd))
+        app.add_handler(CommandHandler("top", commands.top))
 
         asyncio.create_task(self._scan_loop())
 
