@@ -29,8 +29,11 @@ class DealQuality(Enum):
     POOR = "POOR"
 
 PRICE_CENT_THRESHOLD = 100_000
+MIN_COMPARISON_SAMPLES = 3
 
 KENTEKEN_PATTERN = re.compile(r'\b([A-Za-z0-9]{1,3}-[A-Za-z0-9]{1,3}-[A-Za-z0-9]{1,3})\b')
+
+SETTINGS_FILE = Path("runtime_settings.json")
 
 # ---------------------------------------------------------
 # CONFIG MANAGEMENT
@@ -48,10 +51,10 @@ class BotConfig:
 
     min_profit_margin: int = 500
     max_km: int = 220_000
-    price_per_km_limit: float = 0.04
+    price_per_km_limit: float = 0.15  # sanity-check, geen hoofdfilter meer
     seen_max_age_days: int = 30
 
-    market_value_samples: int = 10
+    market_value_samples: int = 30
 
     seen_file: Path = field(default_factory=lambda: Path("seen_links.json"))
 
@@ -68,6 +71,9 @@ class BotConfig:
             telegram_chat_id=chat_id,
             check_interval=int(os.getenv("CHECK_INTERVAL", 8)),
             min_profit_margin=int(os.getenv("MIN_PROFIT_MARGIN", 500)),
+            max_km=int(os.getenv("MAX_KM", 220_000)),
+            price_per_km_limit=float(os.getenv("PRICE_PER_KM_LIMIT", 0.15)),
+            market_value_samples=int(os.getenv("MARKET_VALUE_SAMPLES", 30)),
         )
 
 
@@ -75,14 +81,50 @@ class BotConfig:
 class RuntimeSettings:
     """
     Aanpasbare instellingen tijdens het draaien van de bot.
-    In tegenstelling tot BotConfig (frozen, alleen bij opstart) kunnen
-    deze waarden live gewijzigd worden via /settings, /pause, /resume.
+    Wordt bij elke wijziging opgeslagen in runtime_settings.json
+    zodat /pause en /settings een herstart overleven.
     """
     min_profit_margin: int
     max_km: int
     price_per_km_limit: float
     check_interval: int
     paused: bool = False
+
+
+def load_runtime_settings(bot_config: BotConfig) -> RuntimeSettings:
+    if SETTINGS_FILE.exists():
+        try:
+            data = json.loads(SETTINGS_FILE.read_text())
+            return RuntimeSettings(
+                min_profit_margin=data.get("min_profit_margin", bot_config.min_profit_margin),
+                max_km=data.get("max_km", bot_config.max_km),
+                price_per_km_limit=data.get("price_per_km_limit", bot_config.price_per_km_limit),
+                check_interval=data.get("check_interval", bot_config.check_interval),
+                paused=data.get("paused", False),
+            )
+        except Exception as e:
+            logger.warning(f"Kon runtime_settings.json niet laden: {e}")
+
+    return RuntimeSettings(
+        min_profit_margin=bot_config.min_profit_margin,
+        max_km=bot_config.max_km,
+        price_per_km_limit=bot_config.price_per_km_limit,
+        check_interval=bot_config.check_interval,
+    )
+
+
+def save_runtime_settings(settings: RuntimeSettings):
+    try:
+        data = {
+            "min_profit_margin": settings.min_profit_margin,
+            "max_km": settings.max_km,
+            "price_per_km_limit": settings.price_per_km_limit,
+            "check_interval": settings.check_interval,
+            "paused": settings.paused,
+        }
+        SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        logger.error(f"Kon runtime_settings.json niet opslaan: {e}")
 
 
 @dataclass(frozen=True)
@@ -225,56 +267,38 @@ class RDWClient:
 
 # ---------------------------------------------------------
 # MARKET VALUE CALCULATOR
+# Gebruikt Marktplaats zelf als vergelijkingsmateriaal i.p.v.
+# AutoScout24 (die structureel blokkeerde met 403's). Dit
+# hergebruikt de search-endpoint die al bewezen betrouwbaar werkt.
 # ---------------------------------------------------------
 
 class MarketValueCalculator:
 
-    def __init__(self):
+    def __init__(self, samples: int = 30):
         self._cache: Dict[str, Tuple[Optional[float], datetime]] = {}
         self._success_ttl = timedelta(hours=6)
         self._fail_ttl = timedelta(minutes=15)
+        self._samples = samples
 
-        self._consecutive_failures = 0
-        self._circuit_open_until: Optional[datetime] = None
-        self._failure_threshold = 5
-        self._circuit_cooldown = timedelta(minutes=30)
-
-    def _get_cache_key(self, brand: str, model: str, year: int, km: int) -> str:
+    def _get_cache_key(self, search_term: str, year: int, km: int) -> str:
         km_bracket = (km // 20000) * 20000
-        return f"{brand}_{model}_{year}_{km_bracket}"
-
-    def _circuit_is_open(self) -> bool:
-        if self._circuit_open_until is None:
-            return False
-        if datetime.now() >= self._circuit_open_until:
-            logger.info("🔌 Circuit breaker cooldown voorbij, probeer AutoScout24 weer")
-            self._circuit_open_until = None
-            self._consecutive_failures = 0
-            return False
-        return True
-
-    def _register_failure(self):
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= self._failure_threshold:
-            self._circuit_open_until = datetime.now() + self._circuit_cooldown
-            logger.warning(
-                f"🔌 Circuit breaker OPEN voor AutoScout24 "
-                f"({self._circuit_cooldown.total_seconds() / 60:.0f} min)"
-            )
-
-    def _register_success(self):
-        self._consecutive_failures = 0
+        return f"{search_term}_{year}_{km_bracket}"
 
     async def get_market_value(
         self,
-        brand: str,
-        model: str,
+        search_term: str,
         year: int,
         km: int,
-        client: 'SmartClient'
+        exclude_url: str,
+        client: 'SmartClient',
     ) -> Optional[float]:
+        """
+        Zoekt vergelijkbare advertenties op Marktplaats zelf
+        (zelfde zoekterm, bouwjaar ±1, km ±30.000) en berekent
+        de mediaanprijs als marktwaarde-indicatie.
+        """
 
-        cache_key = self._get_cache_key(brand, model, year, km)
+        cache_key = self._get_cache_key(search_term, year, km)
 
         if cache_key in self._cache:
             value, timestamp = self._cache[cache_key]
@@ -282,68 +306,77 @@ class MarketValueCalculator:
             if datetime.now() - timestamp < ttl:
                 return value
 
-        if self._circuit_is_open():
-            self._cache[cache_key] = (None, datetime.now())
-            return None
-
         search_url = (
-            f"https://www.autoscout24.nl/lst?"
-            f"mmvmk0={brand}&mmvmd0={model}&mmvco=1"
-            f"&fregfrom={year-1}&fregto={year+1}"
-            f"&kmfrom={km-30000}&kmto={km+30000}"
-            f"&sort=standard&desc=0&ustate=N%2CU"
-            f"&size=20&page=0&cy=NL&atype=C"
+            f"https://www.marktplaats.nl/lrp/api/search?"
+            f"query={search_term}&searchInTitleAndDescription=true&limit={self._samples}"
         )
 
-        html = await client.get_html(search_url)
-
-        if not html:
-            self._register_failure()
+        raw = await client.get_html(search_url)
+        if not raw:
             self._cache[cache_key] = (None, datetime.now())
-            logger.warning(f"⚠️  Geen marktdata voor {brand} {model} {year}")
             return None
 
-        prices = self._extract_prices(html)
-
-        if len(prices) < 3:
-            self._register_failure()
+        try:
+            data = json.loads(raw)
+            listings = data.get('listings', [])
+        except Exception as e:
+            logger.debug(f"Marktplaats vergelijk parse error: {e}")
             self._cache[cache_key] = (None, datetime.now())
-            logger.warning(f"⚠️  Te weinig data ({len(prices)} auto's) voor {brand} {model}")
             return None
 
-        self._register_success()
+        prices = []
+        for item in listings:
+            vip_url = item.get('vipUrl', '')
+            full_url = f"https://www.marktplaats.nl{vip_url}"
+            if full_url == exclude_url:
+                continue  # tel de eigen advertentie niet mee
+
+            title = item.get('title', '')
+            price_info = item.get('priceInfo', {})
+            raw_price = price_info.get('priceCents') or price_info.get('price')
+
+            if raw_price is None:
+                continue
+
+            try:
+                item_price = int(raw_price)
+            except (ValueError, TypeError):
+                continue
+
+            if item_price > PRICE_CENT_THRESHOLD:
+                item_price = item_price // 100
+
+            item_year = ListingParser.extract_year(title)
+            item_km = ListingParser.extract_km(title)
+
+            if not item_year or not item_km:
+                continue
+
+            if abs(item_year - year) > 1:
+                continue
+            if abs(item_km - km) > 30000:
+                continue
+
+            if 300 < item_price < 50000:
+                prices.append(item_price)
+
+        if len(prices) < MIN_COMPARISON_SAMPLES:
+            self._cache[cache_key] = (None, datetime.now())
+            logger.warning(
+                f"⚠️  Te weinig vergelijkbare advertenties ({len(prices)}) "
+                f"voor {search_term} {year}"
+            )
+            return None
 
         market_value = statistics.median(prices)
         self._cache[cache_key] = (market_value, datetime.now())
 
-        logger.info(f"💰 Marktwaarde {brand} {model} {year}: €{market_value:.0f} (van {len(prices)} auto's)")
+        logger.info(
+            f"💰 Marktwaarde {search_term} {year} (MP-vergelijk): "
+            f"€{market_value:.0f} (van {len(prices)} advertenties)"
+        )
 
         return market_value
-
-    def _extract_prices(self, html: str) -> List[float]:
-        prices = []
-
-        patterns = [
-            r'data-price="(\d+)"',
-            r'"price"\s*:\s*(\d+)',
-            r'€\s*([\d.]+)',
-        ]
-
-        for pattern in patterns:
-            matches = re.findall(pattern, html)
-            for match in matches:
-                try:
-                    price_str = match.replace('.', '')
-                    price = float(price_str)
-
-                    if 500 < price < 50000:
-                        prices.append(price)
-                except (ValueError, AttributeError):
-                    continue
-
-        prices = sorted(list(set(prices)))
-
-        return prices
 
 # ---------------------------------------------------------
 # DATACLASSES
@@ -392,6 +425,7 @@ class Listing:
     title: str
     price: int
     platform: str
+    search_term: str = ""
     km: Optional[int] = None
     year: Optional[int] = None
     brand: Optional[str] = None
@@ -509,15 +543,19 @@ class Listing:
             self.deal_quality = DealQuality.POOR
             return
 
+        # Losse sanity-check, geen hoofdfilter meer. De marktwaarde-
+        # vergelijking hieronder doet het eigenlijke werk.
         if self.price / self.km > settings.price_per_km_limit:
             self.deal_quality = DealQuality.POOR
             return
 
+        search_term = self.search_term or (self.model.lower() if self.model else "")
+
         market_value = await market_calculator.get_market_value(
-            self.brand,
-            self.model,
+            search_term,
             self.year,
             self.km,
+            self.url,
             client
         )
 
@@ -575,7 +613,7 @@ class Listing:
             market_val = self.market_analysis.market_value
 
             market_info = (
-                f"\n\n💰 WINST ANALYSE:\n"
+                f"\n\n💰 WINST ANALYSE (o.b.v. vergelijkbare MP-advertenties):\n"
                 f"├─ Vraagprijs: €{self.price:,}\n"
                 f"├─ Marktwaarde: €{market_val:,.0f}\n"
                 f"├─ Verkoopprijs*: €{market_val * 0.9:,.0f}\n"
@@ -776,34 +814,50 @@ class ListingParser:
     @staticmethod
     def parse_marktplaats_json(html: str) -> Tuple[Optional[str], Optional[int], str]:
         match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-        if not match:
+
+        if match:
+            try:
+                data = json.loads(match.group(1))
+                listing = data.get("props", {}).get("pageProps", {}).get("listing", {})
+
+                title = listing.get("title", "").strip()
+                description = listing.get("description", "").strip()
+                price_info = listing.get("priceInfo", {})
+
+                raw_price = (
+                    price_info.get("priceCents") or
+                    price_info.get("price") or
+                    price_info.get("askingPrice")
+                )
+
+                if title and raw_price is not None:
+                    price = int(raw_price)
+                    if price > PRICE_CENT_THRESHOLD:
+                        price = price // 100
+                    return title, price, description
+
+            except Exception as e:
+                logger.debug(f"JSON parse mislukt, val terug op regex: {e}")
+
+        # Fallback: als __NEXT_DATA__ ontbreekt of anders is opgebouwd,
+        # probeer via simpele regex title/price te halen zodat de
+        # listing niet stilzwijgend genegeerd wordt.
+        title_match = re.search(r'<title>(.*?)</title>', html)
+        price_match = re.search(r'"price(?:Cents)?"\s*:\s*"?(\d+)"?', html)
+
+        if not title_match or not price_match:
             return None, None, ""
 
+        title = title_match.group(1).strip()
         try:
-            data = json.loads(match.group(1))
-            listing = data.get("props", {}).get("pageProps", {}).get("listing", {})
-
-            title = listing.get("title", "").strip()
-            description = listing.get("description", "").strip()
-            price_info = listing.get("priceInfo", {})
-
-            raw_price = (
-                price_info.get("priceCents") or
-                price_info.get("price") or
-                price_info.get("askingPrice")
-            )
-
-            if not title or raw_price is None:
-                return None, None, ""
-
-            price = int(raw_price)
-            if price > PRICE_CENT_THRESHOLD:
-                price = price // 100
-
-            return title, price, description
-
-        except Exception:
+            price = int(price_match.group(1))
+        except ValueError:
             return None, None, ""
+
+        if price > PRICE_CENT_THRESHOLD:
+            price = price // 100
+
+        return title, price, ""
 
     @staticmethod
     def extract_km(text: str) -> Optional[int]:
@@ -920,11 +974,12 @@ class ProfitScraper:
         filter_config: FilterConfig,
         seen_manager: SeenLinksManager,
         settings: RuntimeSettings,
+        market_samples: int = 30,
     ):
         self.filter_config = filter_config
         self.seen_manager = seen_manager
         self.settings = settings
-        self.market_calculator = MarketValueCalculator()
+        self.market_calculator = MarketValueCalculator(samples=market_samples)
         self.rdw_client = RDWClient()
         self.rss_monitor = MarktplaatsRSSMonitor(filter_config)
 
@@ -934,12 +989,12 @@ class ProfitScraper:
             'deals_found': 0,
         }
 
-        # Bewaar gevonden deals voor /top command (max 100, meest recente)
         self.found_deals: List[Listing] = []
 
     async def process_listing(
         self,
         url: str,
+        search_term: str,
         client: SmartClient,
     ) -> Optional[Listing]:
 
@@ -956,7 +1011,12 @@ class ProfitScraper:
             await self.seen_manager.add(url)
             return None
 
-        km = ListingParser.extract_km(f"{title} {description} {html}")
+        # Eerst proberen op titel+beschrijving (schoner), pas daarna
+        # als laatste redmiddel op de volledige ruwe HTML.
+        km = ListingParser.extract_km(f"{title} {description}")
+        if km is None:
+            km = ListingParser.extract_km(html)
+
         year = ListingParser.extract_year(f"{title} {description}")
 
         try:
@@ -965,6 +1025,7 @@ class ProfitScraper:
                 title=title,
                 price=price,
                 platform="marktplaats",
+                search_term=search_term,
                 km=km,
                 year=year,
                 description=description,
@@ -1015,7 +1076,7 @@ class ProfitScraper:
         if not new_links:
             return []
 
-        tasks = [self.process_listing(link, client) for link in new_links]
+        tasks = [self.process_listing(link, model, client) for link in new_links]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         deals = [r for r in results if isinstance(r, Listing) and r is not None]
@@ -1044,7 +1105,6 @@ class ProfitScraper:
         return self._stats.copy()
 
     def get_top_deals(self, n: int = 5) -> List[Listing]:
-        """Top N deals op basis van winstpotentieel, hoogste eerst."""
         def profit_of(listing: Listing) -> int:
             if listing.market_analysis and listing.market_analysis.profit_potential:
                 return listing.market_analysis.profit_potential
@@ -1080,11 +1140,11 @@ class TelegramNotifier:
     async def send_listing(self, listing: Listing) -> bool:
         return await self.send_message(listing.format_message())
 
-    async def send_startup(self) -> bool:
+    async def send_startup(self, min_profit: int) -> bool:
         message = (
             "💰 PROFIT BOT ACTIEF\n\n"
             f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"🎯 Min. winst: €500\n"
+            f"🎯 Min. winst: €{min_profit}\n"
             "✅ Monitoring gestart"
         )
         return await self.send_message(message)
@@ -1094,19 +1154,32 @@ class TelegramNotifier:
 # ---------------------------------------------------------
 
 class BotCommands:
-    """Handler voor bot commands."""
+    """Handler voor bot commands. Alleen de eigenaar (TELEGRAM_CHAT_ID) mag deze gebruiken."""
 
-    def __init__(self, notifier: TelegramNotifier, scraper: ProfitScraper, settings: RuntimeSettings):
+    def __init__(
+        self,
+        notifier: TelegramNotifier,
+        scraper: ProfitScraper,
+        settings: RuntimeSettings,
+        bot_config: BotConfig,
+    ):
         self.notifier = notifier
         self.scraper = scraper
         self.settings = settings
+        self.bot_config = bot_config
+
+    def _is_authorized(self, update) -> bool:
+        return str(update.effective_chat.id) == str(self.bot_config.telegram_chat_id)
 
     async def start(self, update, context):
+        if not self._is_authorized(update):
+            return
+
         welcome = (
             "🚀 *Welkom bij Auto Profit Bot!*\n\n"
             "Ik scan 24/7 Marktplaats voor winstgevende auto deals.\n\n"
-            "✅ Alleen deals met €500+ winst\n"
-            "✅ Realtime marktwaarde analyse\n"
+            "✅ Alleen deals boven je winstdrempel\n"
+            "✅ Marktwaarde analyse o.b.v. vergelijkbare advertenties\n"
             "✅ Automatische dealer filtering\n\n"
             "Je ontvangt nu automatisch alerts bij goede deals!\n\n"
             "Gebruik /help voor meer info."
@@ -1114,10 +1187,13 @@ class BotCommands:
         await update.message.reply_text(welcome, parse_mode='Markdown')
 
     async def help(self, update, context):
+        if not self._is_authorized(update):
+            return
+
         help_text = (
             "❓ *Hoe werkt de bot?*\n\n"
             "1️⃣ Ik scan regelmatig Marktplaats\n"
-            "2️⃣ Bij nieuwe auto's check ik de marktwaarde\n"
+            "2️⃣ Bij nieuwe auto's vergelijk ik met soortgelijke advertenties\n"
             "3️⃣ Als winst boven de drempel zit: je krijgt een alert!\n\n"
             "📊 *Deal Categorieën:*\n"
             "💎 GODLIKE: €1000+ winst\n"
@@ -1138,6 +1214,9 @@ class BotCommands:
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
     async def stats(self, update, context):
+        if not self._is_authorized(update):
+            return
+
         stats = self.scraper.get_stats()
         status = "⏸️ GEPAUZEERD" if self.settings.paused else "▶️ ACTIEF"
 
@@ -1153,18 +1232,29 @@ class BotCommands:
         await update.message.reply_text(stats_text, parse_mode='Markdown')
 
     async def pause(self, update, context):
+        if not self._is_authorized(update):
+            return
+
         self.settings.paused = True
+        save_runtime_settings(self.settings)
         await update.message.reply_text(
             "⏸️ Bot gepauzeerd. Er wordt niet meer gescand tot je /resume gebruikt."
         )
         logger.info("⏸️ Bot gepauzeerd via Telegram command")
 
     async def resume(self, update, context):
+        if not self._is_authorized(update):
+            return
+
         self.settings.paused = False
+        save_runtime_settings(self.settings)
         await update.message.reply_text("▶️ Bot hervat, scannen gaat weer verder.")
         logger.info("▶️ Bot hervat via Telegram command")
 
     async def settings_cmd(self, update, context):
+        if not self._is_authorized(update):
+            return
+
         args = context.args
 
         if not args:
@@ -1172,7 +1262,7 @@ class BotCommands:
                 "⚙️ *Huidige instellingen*\n\n"
                 f"🎯 Min. winst: €{self.settings.min_profit_margin}\n"
                 f"🛣️ Max. KM: {self.settings.max_km:,}\n"
-                f"💶 Max €/km: {self.settings.price_per_km_limit}\n"
+                f"💶 Max €/km (sanity-check): {self.settings.price_per_km_limit}\n"
                 f"⏱️ Scan interval: {self.settings.check_interval}s\n"
                 f"Status: {'⏸️ GEPAUZEERD' if self.settings.paused else '▶️ ACTIEF'}\n\n"
                 "*Wijzigen:*\n"
@@ -1197,24 +1287,41 @@ class BotCommands:
 
         try:
             if option == "minprofit":
-                self.settings.min_profit_margin = int(value_raw)
-                await update.message.reply_text(
-                    f"✅ Min. winst ingesteld op €{self.settings.min_profit_margin}"
-                )
+                value = int(value_raw)
+                if value < 0:
+                    await update.message.reply_text("⚠️ Min. winst kan niet negatief zijn.")
+                    return
+                self.settings.min_profit_margin = value
+                save_runtime_settings(self.settings)
+                await update.message.reply_text(f"✅ Min. winst ingesteld op €{value}")
+
             elif option == "maxkm":
-                self.settings.max_km = int(value_raw)
-                await update.message.reply_text(
-                    f"✅ Max. KM ingesteld op {self.settings.max_km:,}"
-                )
+                value = int(value_raw)
+                if not (0 < value <= 1_000_000):
+                    await update.message.reply_text("⚠️ Max KM moet tussen 1 en 1.000.000 liggen.")
+                    return
+                self.settings.max_km = value
+                save_runtime_settings(self.settings)
+                await update.message.reply_text(f"✅ Max. KM ingesteld op {value:,}")
+
             elif option == "pricekm":
-                self.settings.price_per_km_limit = float(value_raw)
-                await update.message.reply_text(
-                    f"✅ Max €/km ingesteld op {self.settings.price_per_km_limit}"
-                )
+                value = float(value_raw)
+                if not (0 < value <= 5):
+                    await update.message.reply_text("⚠️ Max €/km moet tussen 0 en 5 liggen.")
+                    return
+                self.settings.price_per_km_limit = value
+                save_runtime_settings(self.settings)
+                await update.message.reply_text(f"✅ Max €/km ingesteld op {value}")
+
             elif option == "interval":
-                self.settings.check_interval = int(value_raw)
+                value = int(value_raw)
+                if not (3 <= value <= 3600):
+                    await update.message.reply_text("⚠️ Interval moet tussen 3 en 3600 seconden liggen.")
+                    return
+                self.settings.check_interval = value
+                save_runtime_settings(self.settings)
                 await update.message.reply_text(
-                    f"✅ Scan interval ingesteld op {self.settings.check_interval}s\n"
+                    f"✅ Scan interval ingesteld op {value}s\n"
                     f"(gaat in vanaf de volgende scan-cyclus)"
                 )
             else:
@@ -1225,6 +1332,9 @@ class BotCommands:
             await update.message.reply_text("⚠️ Ongeldige waarde, gebruik een getal.")
 
     async def top(self, update, context):
+        if not self._is_authorized(update):
+            return
+
         top_deals = self.scraper.get_top_deals(5)
 
         if not top_deals:
@@ -1249,6 +1359,13 @@ class BotCommands:
         )
 
 # ---------------------------------------------------------
+# TELEGRAM ERROR HANDLER
+# ---------------------------------------------------------
+
+async def telegram_error_handler(update, context):
+    logger.error(f"Telegram handler error: {context.error}", exc_info=context.error)
+
+# ---------------------------------------------------------
 # MAIN BOT
 # ---------------------------------------------------------
 
@@ -1258,12 +1375,7 @@ class ProfitBot:
         self.bot_config = bot_config
         self.filter_config = filter_config
 
-        self.settings = RuntimeSettings(
-            min_profit_margin=bot_config.min_profit_margin,
-            max_km=bot_config.max_km,
-            price_per_km_limit=bot_config.price_per_km_limit,
-            check_interval=bot_config.check_interval,
-        )
+        self.settings = load_runtime_settings(bot_config)
 
         self.seen_manager = SeenLinksManager(
             bot_config.seen_file,
@@ -1286,7 +1398,7 @@ class ProfitBot:
 
     async def _scan_loop(self):
         logger.info("🚀 Profit scan gestart")
-        await self.notifier.send_startup()
+        await self.notifier.send_startup(self.settings.min_profit_margin)
 
         async with SmartClient(self.bot_config) as client:
             while not self._shutdown.is_set():
@@ -1323,9 +1435,10 @@ class ProfitBot:
             self.filter_config,
             self.seen_manager,
             self.settings,
+            self.bot_config.market_value_samples,
         )
 
-        commands = BotCommands(self.notifier, self.scraper, self.settings)
+        commands = BotCommands(self.notifier, self.scraper, self.settings, self.bot_config)
         app.add_handler(CommandHandler("start", commands.start))
         app.add_handler(CommandHandler("help", commands.help))
         app.add_handler(CommandHandler("stats", commands.stats))
@@ -1333,6 +1446,7 @@ class ProfitBot:
         app.add_handler(CommandHandler("resume", commands.resume))
         app.add_handler(CommandHandler("settings", commands.settings_cmd))
         app.add_handler(CommandHandler("top", commands.top))
+        app.add_error_handler(telegram_error_handler)
 
         asyncio.create_task(self._scan_loop())
 
@@ -1341,7 +1455,7 @@ class ProfitBot:
 
     def run(self):
         logger.info("💰 PROFIT BOT START")
-        logger.info(f"🎯 Min winst: €{self.bot_config.min_profit_margin}")
+        logger.info(f"🎯 Min winst: €{self.settings.min_profit_margin}")
 
         try:
             app = (
