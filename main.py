@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional, Dict, List, Set, Tuple
 from datetime import datetime, timedelta
 from enum import Enum
+from zoneinfo import ZoneInfo
 from telegram.ext import ApplicationBuilder, CommandHandler
 import sys
 
@@ -159,6 +160,25 @@ class ColoredFormatter(logging.Formatter):
     }
     RESET = '\033[0m'
 
+    def __init__(self, fmt, timezone='Europe/Amsterdam'):
+        super().__init__(fmt)
+        try:
+            self.timezone = ZoneInfo(timezone)
+        except:
+            # Fallback als zoneinfo niet beschikbaar is
+            self.timezone = None
+    
+    def formatTime(self, record, datefmt=None):
+        """Override om lokale tijd te gebruiken ipv UTC"""
+        if self.timezone:
+            dt = datetime.fromtimestamp(record.created, tz=self.timezone)
+        else:
+            dt = datetime.fromtimestamp(record.created)
+        
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime('%Y-%m-%d %H:%M:%S')
+
     def format(self, record):
         log_color = self.COLORS.get(record.levelname, self.RESET)
         record.levelname = f"{log_color}{record.levelname}{self.RESET}"
@@ -170,13 +190,19 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
 
     console_handler = logging.StreamHandler(stream=sys.stdout)
     console_handler.setFormatter(
-        ColoredFormatter("%(asctime)s [%(levelname)s] %(message)s")
+        ColoredFormatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            timezone='Europe/Amsterdam'
+        )
     )
     logger.addHandler(console_handler)
 
     file_handler = logging.FileHandler("bot.log")
     file_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        ColoredFormatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            timezone='Europe/Amsterdam'
+        )
     )
     logger.addHandler(file_handler)
 
@@ -200,7 +226,7 @@ def notify_shutdown_sync(token: str, chat_id: str, reason: str = "Bot is gestopt
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         text = (
             f"🛑 {reason}\n"
-            f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"📅 {datetime.now(ZoneInfo('Europe/Amsterdam')).strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"⚠️ De bot zoekt niet meer verder naar deals."
         )
         data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
@@ -269,15 +295,6 @@ class RDWClient:
 
 # ---------------------------------------------------------
 # MARKET VALUE CALCULATOR
-#
-# Werkt nu met ÉÉN brede steekproef per model (tot 50 advertenties),
-# gecached voor enkele uren, in plaats van een aparte, smalle
-# zoekopdracht per individuele listing. Dit voorkomt zowel:
-#  1) "0 vergelijkbare advertenties" (door te weinig data per query)
-#  2) Marktplaats-blokkades (door te veel losse requests)
-#
-# Matching gebeurt progressief breder, met een heuristische fallback
-# als er letterlijk geen directe matches te vinden zijn.
 # ---------------------------------------------------------
 
 class MarketValueCalculator:
@@ -323,8 +340,6 @@ class MarketValueCalculator:
         raw = await client.get_html(search_url)
 
         if not raw:
-            # Bij falen: gebruik eventueel oude (verlopen) cache liever
-            # dan niets, om extra requests te vermijden tijdens problemen.
             if search_term in self._pool_cache:
                 logger.debug(f"Pool-fetch mislukt voor {search_term}, gebruik oude cache")
                 return self._pool_cache[search_term][0]
@@ -425,7 +440,6 @@ class MarketValueCalculator:
         if years_known:
             avg_year = statistics.mean(years_known)
             year_diff = year - avg_year
-            # Ruwe vuistregel: ~8% waardevermindering per jaar ouder
             adjustment = 1 + (year_diff * 0.08)
             adjustment = max(0.3, min(1.5, adjustment))
             estimate = base_median * adjustment
@@ -786,8 +800,6 @@ class SmartClient:
         self._ua_index = 0
         self._domain_delays: Dict[str, datetime] = {}
         self._domain_locks: Dict[str, asyncio.Lock] = {}
-        # Gedeelde cooldown per domein: voorkomt dat meerdere gelijktijdige
-        # requests een geblokkeerd domein blijven hameren tijdens een block.
         self._domain_block_until: Dict[str, datetime] = {}
 
     def _rotate_ua(self) -> str:
@@ -1224,7 +1236,7 @@ class TelegramNotifier:
     async def send_startup(self, min_profit: int) -> bool:
         message = (
             "💰 PROFIT BOT ACTIEF\n\n"
-            f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"📅 {datetime.now(ZoneInfo('Europe/Amsterdam')).strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"🎯 Min. winst: €{min_profit}\n"
             "✅ Monitoring gestart"
         )
