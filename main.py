@@ -5,9 +5,8 @@ import asyncio
 import aiohttp
 import re
 import signal
-import hashlib
 import statistics
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, List, Set, Tuple
 from datetime import datetime, timedelta
@@ -934,8 +933,7 @@ class TelegramNotifier:
         message = (
             "💰 PROFIT BOT ACTIEF\n\n"
             f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"🎯 Min. winst: €{500}\n"
-            f"🚗 Modellen: {len([])}\n"
+            f"🎯 Min. winst: €500\n"
             "✅ Monitoring gestart"
         )
         return await self.send_message(message)
