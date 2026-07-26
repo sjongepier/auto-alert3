@@ -28,15 +28,80 @@ class DealQuality(Enum):
     EXCELLENT = "EXCELLENT"
     GOOD = "GOOD"
     AVERAGE = "AVERAGE"
-    WATCHLIST = "WATCHLIST"  # NIEUW: bijna goede deal
+    WATCHLIST = "WATCHLIST"
     POOR = "POOR"
 
 PRICE_CENT_THRESHOLD = 100_000
-MIN_COMPARISON_SAMPLES = 1  # VERLAAGD van 3 naar 1
+MIN_COMPARISON_SAMPLES = 1
 
 KENTEKEN_PATTERN = re.compile(r'\b([A-Za-z0-9]{1,3}-[A-Za-z0-9]{1,3}-[A-Za-z0-9]{1,3})\b')
 
 SETTINGS_FILE = Path("runtime_settings.json")
+
+# ---------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------
+
+class ColoredFormatter(logging.Formatter):
+    COLORS = {
+        'DEBUG': '\033[36m',
+        'INFO': '\033[32m',
+        'WARNING': '\033[33m',
+        'ERROR': '\033[31m',
+        'CRITICAL': '\033[35m',
+    }
+    RESET = '\033[0m'
+
+    def __init__(self, fmt, timezone='Europe/Amsterdam'):
+        super().__init__(fmt)
+        try:
+            self.timezone = ZoneInfo(timezone)
+        except:
+            self.timezone = None
+    
+    def formatTime(self, record, datefmt=None):
+        if self.timezone:
+            dt = datetime.fromtimestamp(record.created, tz=self.timezone)
+        else:
+            dt = datetime.fromtimestamp(record.created)
+        
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    def format(self, record):
+        log_color = self.COLORS.get(record.levelname, self.RESET)
+        record.levelname = f"{log_color}{record.levelname}{self.RESET}"
+        return super().format(record)
+
+def setup_logging(level: int = logging.DEBUG) -> logging.Logger:  # DEBUG ipv INFO
+    logger = logging.getLogger("profit-bot")
+    logger.setLevel(level)
+    
+    # Verwijder bestaande handlers
+    logger.handlers = []
+
+    console_handler = logging.StreamHandler(stream=sys.stdout)
+    console_handler.setFormatter(
+        ColoredFormatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            timezone='Europe/Amsterdam'
+        )
+    )
+    logger.addHandler(console_handler)
+
+    file_handler = logging.FileHandler("bot.log")
+    file_handler.setFormatter(
+        ColoredFormatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            timezone='Europe/Amsterdam'
+        )
+    )
+    logger.addHandler(file_handler)
+
+    return logger
+
+logger = setup_logging()
 
 # ---------------------------------------------------------
 # CONFIG MANAGEMENT
@@ -44,10 +109,9 @@ SETTINGS_FILE = Path("runtime_settings.json")
 
 @dataclass(frozen=True)
 class BotConfig:
-    """Opstart-configuratie, geladen uit env vars. Onveranderlijk tijdens runtime."""
     telegram_token: str
     telegram_chat_id: str
-    check_interval: int = 15  # VERLAAGD van 20 naar 15
+    check_interval: int = 15
     max_concurrent_requests: int = 5
     request_timeout: int = 15
     max_retries: int = 3
@@ -84,7 +148,6 @@ class BotConfig:
 
 @dataclass
 class RuntimeSettings:
-    """Aanpasbare instellingen tijdens het draaien van de bot."""
     min_profit_margin: int
     max_km: int
     price_per_km_limit: float
@@ -135,7 +198,7 @@ class FilterConfig:
     dealer_words: List[str]
     red_flags: List[str]
     quality_indicators: List[str]
-    model_aliases: Dict[str, List[str]] = field(default_factory=dict)  # NIEUW
+    model_aliases: Dict[str, List[str]] = field(default_factory=dict)
 
     @classmethod
     def from_file(cls, path: Path) -> 'FilterConfig':
@@ -149,70 +212,8 @@ class FilterConfig:
             dealer_words=data.get("dealer_words", []),
             red_flags=data.get("red_flags", []),
             quality_indicators=data.get("quality_indicators", []),
-            model_aliases=data.get("model_aliases", {}),  # NIEUW
+            model_aliases=data.get("model_aliases", {}),
         )
-
-# ---------------------------------------------------------
-# LOGGING
-# ---------------------------------------------------------
-
-class ColoredFormatter(logging.Formatter):
-    COLORS = {
-        'DEBUG': '\033[36m',
-        'INFO': '\033[32m',
-        'WARNING': '\033[33m',
-        'ERROR': '\033[31m',
-        'CRITICAL': '\033[35m',
-    }
-    RESET = '\033[0m'
-
-    def __init__(self, fmt, timezone='Europe/Amsterdam'):
-        super().__init__(fmt)
-        try:
-            self.timezone = ZoneInfo(timezone)
-        except:
-            self.timezone = None
-    
-    def formatTime(self, record, datefmt=None):
-        if self.timezone:
-            dt = datetime.fromtimestamp(record.created, tz=self.timezone)
-        else:
-            dt = datetime.fromtimestamp(record.created)
-        
-        if datefmt:
-            return dt.strftime(datefmt)
-        return dt.strftime('%Y-%m-%d %H:%M:%S')
-
-    def format(self, record):
-        log_color = self.COLORS.get(record.levelname, self.RESET)
-        record.levelname = f"{log_color}{record.levelname}{self.RESET}"
-        return super().format(record)
-
-def setup_logging(level: int = logging.INFO) -> logging.Logger:
-    logger = logging.getLogger("profit-bot")
-    logger.setLevel(level)
-
-    console_handler = logging.StreamHandler(stream=sys.stdout)
-    console_handler.setFormatter(
-        ColoredFormatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
-            timezone='Europe/Amsterdam'
-        )
-    )
-    logger.addHandler(console_handler)
-
-    file_handler = logging.FileHandler("bot.log")
-    file_handler.setFormatter(
-        ColoredFormatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
-            timezone='Europe/Amsterdam'
-        )
-    )
-    logger.addHandler(file_handler)
-
-    return logger
-
-logger = setup_logging()
 
 # ---------------------------------------------------------
 # SHUTDOWN NOTIFICATIE
@@ -285,10 +286,7 @@ class RDWClient:
 
             info = results[0]
             self._cache[kenteken] = info
-            logger.info(
-                f"🪪 RDW check OK: {kenteken} → "
-                f"{info.get('merk', '?')} {info.get('handelsbenaming', '?')}"
-            )
+            logger.debug(f"✅ RDW: {kenteken} → {info.get('merk', '?')} {info.get('handelsbenaming', '?')}")
             return info
 
         except Exception as e:
@@ -298,12 +296,10 @@ class RDWClient:
 
 
 # ---------------------------------------------------------
-# PRICE HISTORY TRACKER (NIEUW)
+# PRICE HISTORY TRACKER
 # ---------------------------------------------------------
 
 class PriceHistoryTracker:
-    """Track prijsveranderingen van listings"""
-    
     def __init__(self):
         self._history: Dict[str, List[Tuple[datetime, int]]] = {}
     
@@ -312,12 +308,10 @@ class PriceHistoryTracker:
             self._history[url] = []
         self._history[url].append((datetime.now(), price))
         
-        # Hou maximaal 10 entries per URL
         if len(self._history[url]) > 10:
             self._history[url] = self._history[url][-10:]
     
     def price_dropped(self, url: str, current_price: int) -> Optional[int]:
-        """Return hoeveel prijs gedaald is, of None"""
         if url not in self._history or len(self._history[url]) < 2:
             return None
         
@@ -326,7 +320,6 @@ class PriceHistoryTracker:
         return drop if drop > 0 else None
     
     def cleanup_old(self, days: int = 7):
-        """Verwijder entries ouder dan X dagen"""
         cutoff = datetime.now() - timedelta(days=days)
         for url in list(self._history.keys()):
             self._history[url] = [
@@ -368,6 +361,7 @@ class MarketValueCalculator:
         if search_term in self._pool_cache:
             pool, timestamp = self._pool_cache[search_term]
             if datetime.now() - timestamp < self._pool_ttl:
+                logger.debug(f"📦 Pool cache hit voor {search_term}")
                 return pool
 
         search_url = (
@@ -375,17 +369,20 @@ class MarketValueCalculator:
             f"query={search_term}&searchInTitleAndDescription=true&limit={self._samples}"
         )
 
+        logger.debug(f"🔍 Ophalen pool voor {search_term}")
         raw = await client.get_html(search_url)
 
         if not raw:
             if search_term in self._pool_cache:
                 logger.debug(f"Pool-fetch mislukt voor {search_term}, gebruik oude cache")
                 return self._pool_cache[search_term][0]
+            logger.warning(f"❌ Kon pool niet ophalen voor {search_term}")
             return []
 
         try:
             data = json.loads(raw)
             listings = data.get('listings', [])
+            logger.debug(f"📊 {len(listings)} listings gevonden voor {search_term}")
         except Exception as e:
             logger.debug(f"Pool parse error voor {search_term}: {e}")
             return []
@@ -423,7 +420,7 @@ class MarketValueCalculator:
             })
 
         self._pool_cache[search_term] = (pool, datetime.now())
-        logger.debug(f"📦 Pool opgebouwd voor {search_term}: {len(pool)} bruikbare advertenties")
+        logger.debug(f"✅ Pool opgebouwd voor {search_term}: {len(pool)} bruikbare advertenties")
 
         return pool
 
@@ -435,14 +432,17 @@ class MarketValueCalculator:
         exclude_url: str,
         client: 'SmartClient',
     ) -> Tuple[Optional[float], bool]:
+        
         raw_pool = await self._get_pool(search_term, client)
         pool = [p for p in raw_pool if p['url'] != exclude_url]
 
         if not pool:
+            logger.warning(f"❌ Geen pool data voor {search_term}")
             return None, False
 
-        # VERSOEPELDE tolerances - breder zoeken
-        tolerances = [(2, 50_000), (3, 80_000), (5, 120_000)]  # Was: [(1, 30_000), (2, 60_000), (3, 100_000)]
+        logger.debug(f"🔎 Zoek marktwaarde voor {search_term} {year} ({km:,} km)")
+
+        tolerances = [(2, 50_000), (3, 80_000), (5, 120_000)]
         
         for year_tol, km_tol in tolerances:
             matches = [
@@ -451,20 +451,21 @@ class MarketValueCalculator:
                 and abs(p['year'] - year) <= year_tol
                 and abs(p['km'] - km) <= km_tol
             ]
+            
+            logger.debug(f"  Tolerantie ±{year_tol}j/±{km_tol}km: {len(matches)} matches")
+            
             if len(matches) >= MIN_COMPARISON_SAMPLES:
                 value = statistics.median(matches)
                 logger.info(
                     f"💰 Marktwaarde {search_term} {year}: €{value:.0f} "
-                    f"(van {len(matches)} directe matches, ±{year_tol}j/±{km_tol}km)"
+                    f"({len(matches)} matches, ±{year_tol}j/±{km_tol}km)"
                 )
                 return value, False
 
-        # Fallback: ruwe schatting
+        # Fallback
         priced = [p for p in pool if p['price'] is not None]
         if len(priced) < MIN_COMPARISON_SAMPLES:
-            logger.warning(
-                f"⚠️  Te weinig data ({len(priced)}) voor {search_term} {year}"
-            )
+            logger.warning(f"⚠️  Te weinig data ({len(priced)}) voor {search_term} {year}")
             return None, False
 
         base_median = statistics.median([p['price'] for p in priced])
@@ -479,10 +480,7 @@ class MarketValueCalculator:
         else:
             estimate = base_median
 
-        logger.info(
-            f"💰 Marktwaarde {search_term} {year} (SCHATTING): €{estimate:.0f} "
-            f"(basis: {len(priced)} advertenties)"
-        )
+        logger.info(f"💰 Marktwaarde {search_term} {year} (SCHATTING): €{estimate:.0f}")
 
         return estimate, True
 
@@ -509,6 +507,7 @@ class MarketAnalysis:
     ) -> 'MarketAnalysis':
 
         if not market_value:
+            logger.debug(f"  ❌ Geen marktwaarde beschikbaar")
             return cls(
                 asking_price=asking_price,
                 market_value=None,
@@ -518,17 +517,19 @@ class MarketAnalysis:
                 is_estimated=is_estimated,
             )
 
-        # DYNAMISCHE KOSTEN - realistischer
         if asking_price < 2000:
-            cost_factor = 0.95  # €100 kosten
+            cost_factor = 0.95
         elif asking_price < 5000:
-            cost_factor = 0.92  # €400 kosten
+            cost_factor = 0.92
         else:
-            cost_factor = 0.90  # €1000+ kosten
+            cost_factor = 0.90
 
         sell_price = market_value * cost_factor
         profit = int(sell_price - asking_price)
         profit_pct = (profit / asking_price * 100) if asking_price > 0 else 0
+
+        logger.debug(f"  💰 Winst analyse: €{asking_price} → €{sell_price:.0f} = €{profit} winst ({profit_pct:.0f}%)")
+        logger.debug(f"  🎯 Min. winst: €{min_profit}, Behaald: €{profit}, Profitable: {profit >= min_profit}")
 
         return cls(
             asking_price=asking_price,
@@ -563,8 +564,8 @@ class Listing:
     kenteken: Optional[str] = field(default=None, init=False, repr=False)
     rdw_verified: bool = field(default=False, init=False, repr=False)
     
-    is_urgent: bool = field(default=False, init=False, repr=False)  # NIEUW
-    price_drop: Optional[int] = field(default=None, init=False, repr=False)  # NIEUW
+    is_urgent: bool = field(default=False, init=False, repr=False)
+    price_drop: Optional[int] = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.price < 0:
@@ -606,7 +607,6 @@ class Listing:
                 self.model = words[1]
 
     def detect_urgency(self) -> bool:
-        """NIEUW: Detecteer urgente verkoop signalen"""
         urgency_signals = [
             r'snel\s+weg',
             r'deze\s+week',
@@ -626,20 +626,25 @@ class Listing:
     async def _try_rdw_check(self, rdw_client: RDWClient, client: 'SmartClient') -> None:
         kenteken = extract_kenteken(f"{self.title} {self.description}")
         if not kenteken:
+            logger.debug(f"  🔍 Geen kenteken gevonden")
             return
 
         self.kenteken = kenteken
         rdw_info = await rdw_client.lookup(kenteken, client)
 
         if not rdw_info:
+            logger.debug(f"  ❌ RDW info niet gevonden voor {kenteken}")
             return
 
         self.rdw_verified = True
+        logger.debug(f"  ✅ RDW verificatie OK voor {kenteken}")
 
         rdw_date = rdw_info.get('datum_eerste_toelating')
         if rdw_date and len(str(rdw_date)) >= 4:
             try:
+                old_year = self.year
                 self.year = int(str(rdw_date)[:4])
+                logger.debug(f"  📅 Jaar via RDW: {old_year} → {self.year}")
             except ValueError:
                 pass
 
@@ -659,42 +664,68 @@ class Listing:
         client: 'SmartClient'
     ) -> None:
 
+        logger.debug(f"\n{'='*60}")
+        logger.debug(f"🔍 ANALYSE: {self.title[:50]}...")
+        logger.debug(f"  💶 Prijs: €{self.price:,}")
+        logger.debug(f"  📏 KM: {self.km:,}" if self.km else "  📏 KM: onbekend")
+        logger.debug(f"  📅 Jaar: {self.year}" if self.year else "  📅 Jaar: onbekend")
+
         combined_text = f"{self.title} {self.description}".lower()
 
-        # VERBETERDE dealer detectie - moet 2+ matches hebben
-        dealer_count = sum(1 for word in filter_config.dealer_words if word in combined_text)
+        # Dealer check
+        dealer_matches = [word for word in filter_config.dealer_words if word in combined_text]
+        dealer_count = len(dealer_matches)
         self.is_dealer = dealer_count >= 2
         
-        self.motivated_seller = any(word in combined_text for word in filter_config.motivation_words)
-        self.has_red_flags = any(flag in combined_text for flag in filter_config.red_flags)
+        logger.debug(f"  🏢 Dealer check: {dealer_count} matches {dealer_matches[:3]}")
+        logger.debug(f"  🏢 Is dealer: {self.is_dealer}")
         
-        # NIEUW: urgentie detectie
+        self.motivated_seller = any(word in combined_text for word in filter_config.motivation_words)
+        
+        red_flag_matches = [flag for flag in filter_config.red_flags if flag in combined_text]
+        self.has_red_flags = len(red_flag_matches) > 0
+        
+        logger.debug(f"  🚩 Red flags: {red_flag_matches[:3] if red_flag_matches else 'geen'}")
+        logger.debug(f"  😊 Gemotiveerd: {self.motivated_seller}")
+        
         self.is_urgent = self.detect_urgency()
+        logger.debug(f"  🚨 Urgent: {self.is_urgent}")
 
         self.quality_score = sum(
             1 for indicator in filter_config.quality_indicators
             if indicator in combined_text
         )
+        logger.debug(f"  ⭐ Kwaliteit score: {self.quality_score}/10")
 
-        if self.is_dealer or self.has_red_flags:
+        if self.is_dealer:
+            logger.debug(f"  ❌ GEBLOKKEERD: Dealer")
+            self.deal_quality = DealQuality.POOR
+            return
+            
+        if self.has_red_flags:
+            logger.debug(f"  ❌ GEBLOKKEERD: Red flags")
             self.deal_quality = DealQuality.POOR
             return
 
         await self._try_rdw_check(rdw_client, client)
 
-        # VERSOEPELD: ook zonder jaar/km doorsturen als prijs extreem laag is
+        # Versoepelde check
         if self.year and self.km and self.brand and self.model:
-            # Volledige analyse mogelijk
+            logger.debug(f"  ✅ Volledige data aanwezig")
             
             if self.km > settings.max_km:
+                logger.debug(f"  ❌ GEBLOKKEERD: KM te hoog ({self.km:,} > {settings.max_km:,})")
                 self.deal_quality = DealQuality.POOR
                 return
 
-            if self.price / self.km > settings.price_per_km_limit:
+            price_per_km = self.price / self.km
+            if price_per_km > settings.price_per_km_limit:
+                logger.debug(f"  ❌ GEBLOKKEERD: €/km te hoog (€{price_per_km:.2f} > €{settings.price_per_km_limit})")
                 self.deal_quality = DealQuality.POOR
                 return
 
             search_term = self.search_term or (self.model.lower() if self.model else "")
+            logger.debug(f"  🔎 Zoekterm voor marktwaarde: '{search_term}'")
 
             market_value, is_estimated = await market_calculator.get_market_value(
                 search_term,
@@ -704,11 +735,10 @@ class Listing:
                 client
             )
 
-            # AANGEPASTE winstdrempel bij urgentie
             adjusted_min_profit = settings.min_profit_margin
             if self.is_urgent:
                 adjusted_min_profit = int(settings.min_profit_margin * 0.7)
-                logger.info(f"🚨 Urgentie: verlaagde drempel naar €{adjusted_min_profit}")
+                logger.debug(f"  🚨 Urgentie: winstdrempel €{settings.min_profit_margin} → €{adjusted_min_profit}")
 
             self.market_analysis = MarketAnalysis.analyze(
                 self.price,
@@ -718,19 +748,22 @@ class Listing:
             )
 
             if not self.market_analysis.is_profitable:
-                # Check of het "bijna" is
                 profit = self.market_analysis.profit_potential or 0
                 shortage = adjusted_min_profit - profit
                 
-                if 0 <= shortage <= 200:  # Binnen €200
+                logger.debug(f"  💔 Niet winstgevend: €{profit} < €{adjusted_min_profit}")
+                
+                if 0 <= shortage <= 200:
+                    logger.debug(f"  👀 WATCHLIST: €{shortage} tekort")
                     self.deal_quality = DealQuality.WATCHLIST
-                    logger.info(f"👀 Bijna-deal: €{shortage} onder drempel")
                     return
                 
+                logger.debug(f"  ❌ GEBLOKKEERD: Te weinig winst")
                 self.deal_quality = DealQuality.POOR
                 return
 
             profit = self.market_analysis.profit_potential or 0
+            logger.debug(f"  ✅ Winstgevend: €{profit}")
 
             if profit >= 1500:
                 self.deal_quality = DealQuality.GODLIKE
@@ -743,18 +776,22 @@ class Listing:
             else:
                 self.deal_quality = DealQuality.POOR
                 
+            logger.debug(f"  🎯 Deal quality: {self.deal_quality.value}")
+                
         else:
-            # NIEUW: incomplete data, maar check of het potentieel interessant is
+            logger.debug(f"  ⚠️  Incomplete data (jaar={self.year}, km={self.km}, brand={self.brand}, model={self.model})")
+            
             if self.km and self.price / self.km < 0.05:
-                # Extreem lage prijs per km
+                logger.debug(f"  ✅ Extreem lage €/km: €{self.price/self.km:.2f}")
                 self.deal_quality = DealQuality.AVERAGE
-                logger.info(f"🔔 Potentiële deal (incomplete): €{self.price} / {self.km}km = €{self.price/self.km:.2f}/km")
             elif self.price < 1000 and not self.is_dealer:
-                # Extreem lage totaalprijs
+                logger.debug(f"  ✅ Extreem lage prijs: €{self.price}")
                 self.deal_quality = DealQuality.AVERAGE
-                logger.info(f"🔔 Potentiële deal (laag geprijsd): €{self.price}")
             else:
+                logger.debug(f"  ❌ GEBLOKKEERD: Incomplete data + geen speciale voorwaarden")
                 self.deal_quality = DealQuality.POOR
+
+        logger.debug(f"{'='*60}\n")
 
     @property
     def is_good_deal(self) -> bool:
@@ -802,7 +839,6 @@ class Listing:
             if self.market_analysis.is_estimated:
                 estimate_note = "\n⚠️ Schatting (weinig vergelijkingen)"
 
-            # Bereken dynamische kosten voor weergave
             if self.price < 2000:
                 cost_pct = 5
             elif self.price < 5000:
@@ -820,7 +856,6 @@ class Listing:
                 f"\n*Na {cost_pct}% kosten"
             )
         elif self.deal_quality in (DealQuality.AVERAGE, DealQuality.WATCHLIST):
-            # Geen marktanalyse, maar wel interessant
             market_info = "\n\n💡 LET OP: Incomplete data, handmatige check nodig!"
             if self.km:
                 market_info += f"\n📊 Prijs/km: €{self.price/self.km:.2f}"
@@ -870,9 +905,9 @@ class SeenLinksManager:
                 url: datetime.fromisoformat(ts)
                 for url, ts in raw_data.items()
             }
-            logger.info(f"Geladen: {len(self._data)} geziene links")
+            logger.info(f"✅ Geladen: {len(self._data)} geziene links")
         except Exception as e:
-            logger.warning(f"Kon seen links niet laden: {e}")
+            logger.warning(f"⚠️  Kon seen links niet laden: {e}")
             self._data = {}
 
     def _save(self):
@@ -888,7 +923,7 @@ class SeenLinksManager:
         self._data = {url: dt for url, dt in self._data.items() if dt > cutoff}
         removed = original - len(self._data)
         if removed > 0:
-            logger.info(f"Cleanup: {removed} oude links verwijderd")
+            logger.info(f"🧹 Cleanup: {removed} oude links verwijderd")
 
     async def contains(self, url: str) -> bool:
         async with self._lock:
@@ -973,7 +1008,7 @@ class SmartClient:
         block_until = self._domain_block_until.get(domain)
         if block_until and datetime.now() < block_until:
             wait = (block_until - datetime.now()).total_seconds()
-            logger.debug(f"⏳ {domain} nog in cooldown, wacht {wait:.0f}s")
+            logger.debug(f"⏳ {domain} in cooldown, wacht {wait:.0f}s")
             await asyncio.sleep(wait)
 
         await self._rate_limit(url)
@@ -1009,10 +1044,12 @@ class SmartClient:
                         elif response.status == 404:
                             return None
                         else:
+                            logger.debug(f"❌ HTTP {response.status} voor {url}")
                             return None
 
                 except Exception as e:
                     self._stats["errors"] += 1
+                    logger.debug(f"❌ Request error (poging {attempt}): {e}")
                     if attempt < self.config.max_retries:
                         await asyncio.sleep(2 ** attempt)
 
@@ -1050,15 +1087,18 @@ class ListingParser:
                     price = int(raw_price)
                     if price > PRICE_CENT_THRESHOLD:
                         price = price // 100
+                    
+                    logger.debug(f"  ✅ Parse OK: {title[:40]}... - €{price}")
                     return title, price, description
 
             except Exception as e:
-                logger.debug(f"JSON parse mislukt, val terug op regex: {e}")
+                logger.debug(f"  ⚠️  JSON parse failed: {e}")
 
         title_match = re.search(r'<title>(.*?)</title>', html)
         price_match = re.search(r'"price(?:Cents)?"\s*:\s*"?(\d+)"?', html)
 
         if not title_match or not price_match:
+            logger.debug(f"  ❌ Geen titel/prijs gevonden in HTML")
             return None, None, ""
 
         title = title_match.group(1).strip()
@@ -1070,6 +1110,7 @@ class ListingParser:
         if price > PRICE_CENT_THRESHOLD:
             price = price // 100
 
+        logger.debug(f"  ✅ Regex parse: {title[:40]}... - €{price}")
         return title, price, ""
 
     @staticmethod
@@ -1086,7 +1127,8 @@ class ListingParser:
                 raw = re.sub(r'[.,\s]', '', match.group(1))
                 try:
                     km = int(raw)
-                    if 100 < km < 500_000:  # VERLAAGD van 1000 naar 100
+                    if 100 < km < 500_000:
+                        logger.debug(f"  📏 KM extracted: {km:,}")
                         return km
                 except ValueError:
                     continue
@@ -1097,7 +1139,6 @@ class ListingParser:
     def extract_year(text: str) -> Optional[int]:
         current_year = datetime.now().year
 
-        # UITGEBREIDE PATRONEN
         specific_patterns = [
             r'bouwjaar[:\s]+(\d{4})',
             r'jaar[:\s]+(\d{4})',
@@ -1116,6 +1157,7 @@ class ListingParser:
                 try:
                     year = int(match.group(1))
                     if 1990 <= year <= current_year:
+                        logger.debug(f"  📅 Jaar extracted (pattern): {year}")
                         return year
                 except ValueError:
                     continue
@@ -1126,7 +1168,9 @@ class ListingParser:
             valid = [int(y) for y in all_years if 1990 <= int(y) <= current_year]
             if valid:
                 counts = Counter(valid)
-                return counts.most_common(1)[0][0]
+                year = counts.most_common(1)[0][0]
+                logger.debug(f"  📅 Jaar extracted (fallback): {year}")
+                return year
 
         return None
 
@@ -1150,11 +1194,14 @@ class MarktplaatsRSSMonitor:
     async def check_rss(self, model: str, client: SmartClient) -> List[str]:
         rss_url = (
             f"https://www.marktplaats.nl/lrp/api/search?"
-            f"query={model}&searchInTitleAndDescription=true&limit=50"  # VERHOOGD van 25 naar 50
+            f"query={model}&searchInTitleAndDescription=true&limit=50"
         )
 
+        logger.debug(f"🔍 RSS fetch voor '{model}'")
         data = await client.get_html(rss_url)
+        
         if not data:
+            logger.warning(f"❌ Geen RSS data voor '{model}'")
             return []
 
         new_listings = []
@@ -1162,6 +1209,8 @@ class MarktplaatsRSSMonitor:
         try:
             json_data = json.loads(data)
             listings = json_data.get('listings', [])
+            
+            logger.debug(f"  📊 {len(listings)} listings in RSS feed")
 
             for listing in listings:
                 listing_id = listing.get('itemId')
@@ -1177,8 +1226,9 @@ class MarktplaatsRSSMonitor:
                 self._seen_items = set(list(self._seen_items)[-1000:])
 
         except Exception as e:
-            logger.debug(f"RSS parse error: {e}")
+            logger.error(f"❌ RSS parse error voor '{model}': {e}")
 
+        logger.debug(f"  ✅ {len(new_listings)} nieuwe listings voor '{model}'")
         return new_listings
 
 # ---------------------------------------------------------
@@ -1204,14 +1254,20 @@ class ProfitScraper:
         )
         self.rdw_client = RDWClient()
         self.rss_monitor = MarktplaatsRSSMonitor(filter_config)
-        self.price_tracker = PriceHistoryTracker()  # NIEUW
+        self.price_tracker = PriceHistoryTracker()
 
         self._stats = {
             'scans': 0,
             'listings_checked': 0,
             'deals_found': 0,
-            'urgent_deals': 0,  # NIEUW
-            'watchlist_deals': 0,  # NIEUW
+            'urgent_deals': 0,
+            'watchlist_deals': 0,
+            'blocked_dealer': 0,
+            'blocked_red_flags': 0,
+            'blocked_km': 0,
+            'blocked_price_km': 0,
+            'blocked_no_profit': 0,
+            'blocked_incomplete': 0,
         }
 
         self.found_deals: List[Listing] = []
@@ -1224,19 +1280,24 @@ class ProfitScraper:
     ) -> Optional[Listing]:
 
         if await self.seen_manager.contains(url):
+            logger.debug(f"⏭️  Skip (already seen): {url}")
             return None
 
+        logger.debug(f"📄 Processing: {url}")
         html = await client.get_html(url)
+        
         if not html:
+            logger.debug(f"  ❌ Geen HTML opgehaald")
             await self.seen_manager.add(url)
             return None
 
         title, price, description = ListingParser.parse_marktplaats_json(html)
+        
         if not title or not price:
+            logger.debug(f"  ❌ Geen titel/prijs")
             await self.seen_manager.add(url)
             return None
 
-        # NIEUW: track prijsverandering
         price_drop = self.price_tracker.price_dropped(url, price)
         self.price_tracker.track(url, price)
 
@@ -1271,13 +1332,20 @@ class ProfitScraper:
             )
 
         except ValueError as e:
-            logger.warning(f"Invalid listing: {e}")
+            logger.warning(f"  ❌ Invalid listing: {e}")
             await self.seen_manager.add(url)
             return None
 
         self._stats['listings_checked'] += 1
 
+        # Track waarom dingen worden geblokkeerd
+        if listing.is_dealer:
+            self._stats['blocked_dealer'] += 1
+        if listing.has_red_flags:
+            self._stats['blocked_red_flags'] += 1
+
         if not listing.is_good_deal:
+            logger.debug(f"  ❌ Geen goede deal (quality={listing.deal_quality.value})")
             await self.seen_manager.add(url)
             return None
 
@@ -1298,7 +1366,7 @@ class ProfitScraper:
         profit = listing.market_analysis.profit_potential if listing.market_analysis else 0
 
         logger.info(
-            f"💰 DEAL: {listing.deal_quality.value} | "
+            f"🎉 DEAL GEVONDEN: {listing.deal_quality.value} | "
             f"€{profit} winst | {listing.brand} {listing.model} {listing.year}"
         )
 
@@ -1323,14 +1391,18 @@ class ProfitScraper:
     async def scan_all(self, client: SmartClient) -> List[Listing]:
 
         self._stats['scans'] += 1
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🚀 SCAN #{self._stats['scans']} GESTART")
+        logger.info(f"{'='*60}\n")
 
-        # NIEUW: gebruik ook aliases
         all_search_terms = []
         for model in self.filter_config.models:
             all_search_terms.append(model)
-            # Voeg aliases toe indien aanwezig
             aliases = self.filter_config.model_aliases.get(model, [])
             all_search_terms.extend(aliases)
+
+        logger.info(f"🔎 Zoektermen: {', '.join(all_search_terms)}")
 
         tasks = [
             self.scan_model(term, client)
@@ -1340,13 +1412,17 @@ class ProfitScraper:
         results = await asyncio.gather(*tasks)
         all_deals = [deal for model_deals in results for deal in model_deals]
 
+        logger.info(f"\n{'='*60}")
         logger.info(
-            f"✅ Scan compleet: {len(all_deals)} deals uit "
-            f"{self._stats['listings_checked']} listings "
-            f"(waarvan {self._stats['urgent_deals']} urgent)"
+            f"✅ SCAN COMPLEET: {len(all_deals)} deals | "
+            f"{self._stats['listings_checked']} bekeken | "
+            f"{self._stats['urgent_deals']} urgent"
         )
+        logger.info(f"📊 BLOKKADES:")
+        logger.info(f"  - Dealers: {self._stats['blocked_dealer']}")
+        logger.info(f"  - Red flags: {self._stats['blocked_red_flags']}")
+        logger.info(f"{'='*60}\n")
 
-        # Cleanup price tracker
         self.price_tracker.cleanup_old()
 
         return all_deals
@@ -1376,15 +1452,17 @@ class TelegramNotifier:
 
     async def send_message(self, message: str) -> bool:
         try:
+            logger.debug(f"📤 Verstuur Telegram bericht ({len(message)} chars)")
             await self.app.bot.send_message(
                 chat_id=self.chat_id,
                 text=message,
                 disable_web_page_preview=True,
             )
             self._stats["sent"] += 1
+            logger.info(f"✅ Telegram bericht verstuurd")
             return True
         except Exception as e:
-            logger.error(f"Telegram error: {e}")
+            logger.error(f"❌ Telegram error: {e}", exc_info=True)
             return False
 
     async def send_listing(self, listing: Listing) -> bool:
@@ -1392,17 +1470,13 @@ class TelegramNotifier:
 
     async def send_startup(self, min_profit: int) -> bool:
         message = (
-            "💰 PROFIT BOT ACTIEF (v2.0)\n\n"
+            "💰 PROFIT BOT ACTIEF (DEBUG MODE)\n\n"
             f"📅 {datetime.now(ZoneInfo('Europe/Amsterdam')).strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"🎯 Min. winst: €{min_profit}\n"
             "✅ Monitoring gestart\n\n"
-            "🆕 NIEUWE FEATURES:\n"
-            "• Urgentie detectie\n"
-            "• Prijsdaling tracking\n"
-            "• Betere jaar/km extractie\n"
-            "• Watchlist deals\n"
-            "• Dynamische kostenberekening"
+            "🔍 DEBUG LOGGING ACTIEF"
         )
+        logger.info("📤 Verstuur startup bericht")
         return await self.send_message(message)
 
 # ---------------------------------------------------------
@@ -1410,7 +1484,6 @@ class TelegramNotifier:
 # ---------------------------------------------------------
 
 class BotCommands:
-    """Handler voor bot commands."""
 
     def __init__(
         self,
@@ -1425,52 +1498,69 @@ class BotCommands:
         self.bot_config = bot_config
 
     def _is_authorized(self, update) -> bool:
-        return str(update.effective_chat.id) == str(self.bot_config.telegram_chat_id)
+        user_id = str(update.effective_chat.id)
+        authorized = user_id == str(self.bot_config.telegram_chat_id)
+        
+        logger.debug(f"🔐 Auth check: user={user_id}, expected={self.bot_config.telegram_chat_id}, authorized={authorized}")
+        
+        return authorized
 
     async def start(self, update, context):
+        logger.info(f"📨 /start command ontvangen van {update.effective_chat.id}")
+        
         if not self._is_authorized(update):
+            logger.warning(f"⛔ Ongeautoriseerde toegang geweigerd")
             return
 
         welcome = (
-            "🚀 *Welkom bij Auto Profit Bot v2.0!*\n\n"
-            "Ik scan 24/7 Marktplaats voor winstgevende auto deals.\n\n"
+            "🚀 *Welkom bij Auto Profit Bot (DEBUG)*\n\n"
+            "Ik scan 24/7 Marktplaats voor deals.\n\n"
             "✅ Marktwaarde analyse\n"
-            "✅ Urgentie detectie 🚨\n"
-            "✅ Prijsdaling tracking 💸\n"
-            "✅ Dealer filtering\n\n"
-            "Je ontvangt automatisch alerts!\n\n"
+            "✅ Urgentie detectie\n"
+            "✅ Prijsdaling tracking\n\n"
+            "🔍 DEBUG MODE ACTIEF\n"
+            "Bekijk bot.log voor details\n\n"
             "Gebruik /help voor meer info."
         )
         await update.message.reply_text(welcome, parse_mode='Markdown')
+        logger.info("✅ Start bericht verstuurd")
 
     async def help(self, update, context):
+        logger.info(f"📨 /help command ontvangen")
+        
         if not self._is_authorized(update):
             return
 
         help_text = (
-            "❓ *Hoe werkt de bot?*\n\n"
-            "1️⃣ Ik scan regelmatig Marktplaats\n"
-            "2️⃣ Vergelijk met soortgelijke advertenties\n"
-            "3️⃣ Detecteer urgentie & prijsdalingen\n"
-            "4️⃣ Stuur alleen goede deals door!\n\n"
-            "📊 *Deal Categorieën:*\n"
-            "💎 GODLIKE: €1500+ winst\n"
-            "🔥🔥 EXCELLENT: €800-1500 winst\n"
-            "🔥 GOOD: €400-800 winst\n"
-            "✅ AVERAGE: €150-400 winst\n"
-            "👀 WATCHLIST: Bijna-deals\n\n"
-            "🚨 *Urgentie:* Verlaagde winstdrempel\n"
-            "💸 *Prijsdaling:* Direct doorgestuurd\n\n"
-            "*Commands:*\n"
+            "❓ *Commands:*\n\n"
             "/stats - Statistieken\n"
             "/top - Beste deals\n"
             "/settings - Instellingen\n"
             "/pause - Pauzeren\n"
-            "/resume - Hervatten"
+            "/resume - Hervatten\n"
+            "/test - Test Telegram verbinding"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
+    async def test(self, update, context):
+        """Test command"""
+        logger.info(f"📨 /test command ontvangen")
+        
+        if not self._is_authorized(update):
+            return
+        
+        test_msg = (
+            "✅ TELEGRAM WERKT!\n\n"
+            f"Chat ID: {update.effective_chat.id}\n"
+            f"Tijd: {datetime.now(ZoneInfo('Europe/Amsterdam')).strftime('%H:%M:%S')}\n"
+            f"Bot draait: JA"
+        )
+        await update.message.reply_text(test_msg)
+        logger.info("✅ Test bericht verstuurd")
+
     async def stats(self, update, context):
+        logger.info(f"📨 /stats command ontvangen")
+        
         if not self._is_authorized(update):
             return
 
@@ -1478,39 +1568,46 @@ class BotCommands:
         status = "⏸️ GEPAUZEERD" if self.settings.paused else "▶️ ACTIEF"
 
         stats_text = (
-            "📊 *Bot Statistieken*\n\n"
+            "📊 *Bot Statistieken (DEBUG)*\n\n"
             f"Status: {status}\n\n"
             f"🔍 Scans: {stats['scans']}\n"
-            f"📋 Listings bekeken: {stats['listings_checked']}\n"
-            f"💰 Deals gevonden: {stats['deals_found']}\n"
-            f"🚨 Urgente deals: {stats['urgent_deals']}\n"
-            f"👀 Watchlist deals: {stats['watchlist_deals']}\n\n"
-            f"⚡ Scan interval: {self.settings.check_interval}s\n"
-            f"🎯 Min. winst: €{self.settings.min_profit_margin}\n"
+            f"📋 Bekeken: {stats['listings_checked']}\n"
+            f"💰 Deals: {stats['deals_found']}\n"
+            f"🚨 Urgent: {stats['urgent_deals']}\n"
+            f"👀 Watchlist: {stats['watchlist_deals']}\n\n"
+            f"❌ BLOKKADES:\n"
+            f"Dealers: {stats['blocked_dealer']}\n"
+            f"Red flags: {stats['blocked_red_flags']}\n\n"
+            f"⚡ Interval: {self.settings.check_interval}s\n"
+            f"🎯 Min. winst: €{self.settings.min_profit_margin}"
         )
         await update.message.reply_text(stats_text, parse_mode='Markdown')
 
     async def pause(self, update, context):
+        logger.info(f"📨 /pause command ontvangen")
+        
         if not self._is_authorized(update):
             return
 
         self.settings.paused = True
         save_runtime_settings(self.settings)
-        await update.message.reply_text(
-            "⏸️ Bot gepauzeerd. Gebruik /resume om te hervatten."
-        )
-        logger.info("⏸️ Bot gepauzeerd via Telegram")
+        await update.message.reply_text("⏸️ Bot gepauzeerd")
+        logger.info("⏸️ Bot gepauzeerd")
 
     async def resume(self, update, context):
+        logger.info(f"📨 /resume command ontvangen")
+        
         if not self._is_authorized(update):
             return
 
         self.settings.paused = False
         save_runtime_settings(self.settings)
-        await update.message.reply_text("▶️ Bot hervat!")
-        logger.info("▶️ Bot hervat via Telegram")
+        await update.message.reply_text("▶️ Bot hervat")
+        logger.info("▶️ Bot hervat")
 
     async def settings_cmd(self, update, context):
+        logger.info(f"📨 /settings command ontvangen")
+        
         if not self._is_authorized(update):
             return
 
@@ -1518,26 +1615,21 @@ class BotCommands:
 
         if not args:
             text = (
-                "⚙️ *Huidige instellingen*\n\n"
+                "⚙️ *Instellingen*\n\n"
                 f"🎯 Min. winst: €{self.settings.min_profit_margin}\n"
                 f"🛣️ Max. KM: {self.settings.max_km:,}\n"
                 f"💶 Max €/km: {self.settings.price_per_km_limit}\n"
-                f"⏱️ Scan interval: {self.settings.check_interval}s\n"
-                f"Status: {'⏸️ GEPAUZEERD' if self.settings.paused else '▶️ ACTIEF'}\n\n"
+                f"⏱️ Interval: {self.settings.check_interval}s\n\n"
                 "*Wijzigen:*\n"
                 "/settings minprofit <bedrag>\n"
                 "/settings maxkm <km>\n"
-                "/settings pricekm <bedrag>\n"
-                "/settings interval <seconden>\n\n"
-                "_Voorbeeld: /settings minprofit 300_"
+                "/settings interval <sec>"
             )
             await update.message.reply_text(text, parse_mode='Markdown')
             return
 
         if len(args) < 2:
-            await update.message.reply_text(
-                "⚠️ Gebruik: /settings <optie> <waarde>"
-            )
+            await update.message.reply_text("⚠️ Gebruik: /settings <optie> <waarde>")
             return
 
         option = args[0].lower()
@@ -1546,56 +1638,38 @@ class BotCommands:
         try:
             if option == "minprofit":
                 value = int(value_raw)
-                if value < 0:
-                    await update.message.reply_text("⚠️ Min. winst kan niet negatief zijn.")
-                    return
                 self.settings.min_profit_margin = value
                 save_runtime_settings(self.settings)
                 await update.message.reply_text(f"✅ Min. winst: €{value}")
+                logger.info(f"⚙️  Min profit aangepast naar €{value}")
 
             elif option == "maxkm":
                 value = int(value_raw)
-                if not (0 < value <= 1_000_000):
-                    await update.message.reply_text("⚠️ Max KM: 1-1.000.000")
-                    return
                 self.settings.max_km = value
                 save_runtime_settings(self.settings)
                 await update.message.reply_text(f"✅ Max. KM: {value:,}")
 
-            elif option == "pricekm":
-                value = float(value_raw)
-                if not (0 < value <= 5):
-                    await update.message.reply_text("⚠️ Max €/km: 0-5")
-                    return
-                self.settings.price_per_km_limit = value
-                save_runtime_settings(self.settings)
-                await update.message.reply_text(f"✅ Max €/km: {value}")
-
             elif option == "interval":
                 value = int(value_raw)
-                if not (3 <= value <= 3600):
-                    await update.message.reply_text("⚠️ Interval: 3-3600s")
-                    return
                 self.settings.check_interval = value
                 save_runtime_settings(self.settings)
                 await update.message.reply_text(f"✅ Interval: {value}s")
+                
             else:
-                await update.message.reply_text(
-                    "⚠️ Opties: minprofit, maxkm, pricekm, interval"
-                )
+                await update.message.reply_text("⚠️ Opties: minprofit, maxkm, interval")
         except ValueError:
             await update.message.reply_text("⚠️ Ongeldige waarde")
 
     async def top(self, update, context):
+        logger.info(f"📨 /top command ontvangen")
+        
         if not self._is_authorized(update):
             return
 
         top_deals = self.scraper.get_top_deals(5)
 
         if not top_deals:
-            await update.message.reply_text(
-                "📭 Nog geen deals sinds herstart."
-            )
+            await update.message.reply_text("📭 Nog geen deals")
             return
 
         lines = ["🏆 *Top 5 deals:*\n"]
@@ -1605,14 +1679,12 @@ class BotCommands:
             lines.append(
                 f"{i}. {deal.deal_quality.value}{urgent}\n"
                 f"   {deal.brand} {deal.model} {deal.year}\n"
-                f"   €{deal.price:,} → winst €{profit:,}\n"
-                f"   {deal.url}"
+                f"   €{deal.price:,} → €{profit:,}\n"
             )
 
         await update.message.reply_text(
-            "\n\n".join(lines),
+            "\n".join(lines),
             parse_mode='Markdown',
-            disable_web_page_preview=True
         )
 
 # ---------------------------------------------------------
@@ -1620,7 +1692,7 @@ class BotCommands:
 # ---------------------------------------------------------
 
 async def telegram_error_handler(update, context):
-    logger.error(f"Telegram error: {context.error}", exc_info=context.error)
+    logger.error(f"❌ Telegram error: {context.error}", exc_info=context.error)
 
 # ---------------------------------------------------------
 # MAIN BOT
@@ -1647,14 +1719,14 @@ class ProfitBot:
 
     def _setup_signals(self):
         def handle(signum, frame):
-            logger.info(f"Shutdown: {signal.Signals(signum).name}")
+            logger.info(f"🛑 Shutdown signal: {signal.Signals(signum).name}")
             self._shutdown.set()
 
         signal.signal(signal.SIGTERM, handle)
         signal.signal(signal.SIGINT, handle)
 
     async def _scan_loop(self):
-        logger.info("🚀 Profit scan gestart (v2.0)")
+        logger.info("🚀 Scan loop gestart")
         await self.notifier.send_startup(self.settings.min_profit_margin)
 
         async with SmartClient(self.bot_config) as client:
@@ -1666,14 +1738,15 @@ class ProfitBot:
                     try:
                         deals = await self.scraper.scan_all(client)
 
+                        logger.info(f"📤 Verstuur {len(deals)} deals naar Telegram")
                         for deal in deals:
                             await self.notifier.send_listing(deal)
-                            await asyncio.sleep(1)  # Verlaagd van 2 naar 1
+                            await asyncio.sleep(1)
 
                         await self.seen_manager.cleanup_and_save()
 
-                    except Exception:
-                        logger.exception("Scan error")
+                    except Exception as e:
+                        logger.exception(f"❌ Scan error: {e}")
 
                 try:
                     await asyncio.wait_for(
@@ -1684,9 +1757,11 @@ class ProfitBot:
                 except asyncio.TimeoutError:
                     pass
 
-        logger.info("Bot gestopt")
+        logger.info("🛑 Bot gestopt")
 
     async def _post_init(self, app):
+        logger.info("🔧 Post-init gestart")
+        
         self.notifier = TelegramNotifier(app, self.bot_config.telegram_chat_id)
         self.scraper = ProfitScraper(
             self.filter_config,
@@ -1697,8 +1772,10 @@ class ProfitBot:
         )
 
         commands = BotCommands(self.notifier, self.scraper, self.settings, self.bot_config)
+        
         app.add_handler(CommandHandler("start", commands.start))
         app.add_handler(CommandHandler("help", commands.help))
+        app.add_handler(CommandHandler("test", commands.test))  # NIEUW
         app.add_handler(CommandHandler("stats", commands.stats))
         app.add_handler(CommandHandler("pause", commands.pause))
         app.add_handler(CommandHandler("resume", commands.resume))
@@ -1706,14 +1783,21 @@ class ProfitBot:
         app.add_handler(CommandHandler("top", commands.top))
         app.add_error_handler(telegram_error_handler)
 
+        logger.info("✅ Handlers geregistreerd")
+        
         asyncio.create_task(self._scan_loop())
+        logger.info("✅ Scan loop task gestart")
 
     async def _post_shutdown(self, app):
+        logger.info("🔧 Post-shutdown")
         await self.seen_manager.cleanup_and_save()
 
     def run(self):
-        logger.info("💰 PROFIT BOT START v2.0")
+        logger.info("="*60)
+        logger.info("💰 PROFIT BOT START (DEBUG MODE)")
         logger.info(f"🎯 Min winst: €{self.settings.min_profit_margin}")
+        logger.info(f"📱 Chat ID: {self.bot_config.telegram_chat_id}")
+        logger.info("="*60)
 
         try:
             app = (
@@ -1724,10 +1808,11 @@ class ProfitBot:
                 .build()
             )
 
+            logger.info("🚀 Start polling...")
             app.run_polling(allowed_updates=None, drop_pending_updates=True)
 
-        except Exception:
-            logger.exception("Fatal error")
+        except Exception as e:
+            logger.exception(f"❌ Fatal error: {e}")
             sys.exit(1)
 
 # ---------------------------------------------------------
@@ -1736,8 +1821,13 @@ class ProfitBot:
 
 def main():
     try:
+        logger.info("🔧 Laden config...")
         bot_config = BotConfig.from_env()
+        
+        logger.info("🔧 Laden filters...")
         filter_config = FilterConfig.from_file(Path("filters.json"))
+        
+        logger.info(f"✅ Config geladen: {len(filter_config.models)} modellen")
 
         atexit.register(
             notify_shutdown_sync,
@@ -1748,8 +1838,8 @@ def main():
         bot = ProfitBot(bot_config, filter_config)
         bot.run()
 
-    except Exception:
-        logger.exception("Startup error")
+    except Exception as e:
+        logger.exception(f"❌ Startup error: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
