@@ -1,0 +1,53 @@
+{
+  "models": [
+    "aygo",
+    "c1",
+    "107",
+    "picanto",
+    "i10",
+    "yaris",
+    "up",
+    "mii",
+    "citigo"
+  ],
+  "motivation_words": [
+    "moet weg",
+    "ivm",
+    "verhuizing",
+    "spoed",
+    "vanavond",
+    "vandaag",
+    "snel verkopen",
+    "geen tijd"
+  ],
+  "dealer_words": [
+    "inruil mogelijk",
+    "garantie",
+    "btw",
+    "bedrijf",
+    "dealer",
+    "occasions",
+    "showroom",
+    "export",
+    "ruime voorraad"
+  ],
+  "red_flags": [
+    "schade",
+    "motorschade",
+    "bpm",
+    "onderdelen",
+    "slopen",
+    "defect",
+    "kapot",
+    "niet rijdend"
+  ],
+  "quality_indicators": [
+    "nieuw apk",
+    "apk tot",
+    "dealer onderhouden",
+    "1e eigenaar",
+    "nap",
+    "goed onderhouden",
+    "nette staat"
+  ]
+}
