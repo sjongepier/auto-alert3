@@ -74,11 +74,10 @@ class ColoredFormatter(logging.Formatter):
         record.levelname = f"{log_color}{record.levelname}{self.RESET}"
         return super().format(record)
 
-def setup_logging(level: int = logging.DEBUG) -> logging.Logger:  # DEBUG ipv INFO
+def setup_logging(level: int = logging.DEBUG) -> logging.Logger:
     logger = logging.getLogger("profit-bot")
     logger.setLevel(level)
     
-    # Verwijder bestaande handlers
     logger.handlers = []
 
     console_handler = logging.StreamHandler(stream=sys.stdout)
@@ -672,10 +671,10 @@ class Listing:
 
         combined_text = f"{self.title} {self.description}".lower()
 
-        # Dealer check
+        # ✅ AANGEPAST: Meer specifieke dealer check
         dealer_matches = [word for word in filter_config.dealer_words if word in combined_text]
         dealer_count = len(dealer_matches)
-        self.is_dealer = dealer_count >= 2
+        self.is_dealer = dealer_count >= 3  # ← GEWIJZIGD: van 2 naar 3
         
         logger.debug(f"  🏢 Dealer check: {dealer_count} matches {dealer_matches[:3]}")
         logger.debug(f"  🏢 Is dealer: {self.is_dealer}")
@@ -709,7 +708,7 @@ class Listing:
 
         await self._try_rdw_check(rdw_client, client)
 
-        # Versoepelde check
+        # ✅ AANGEPAST: Verbeterde data validatie
         if self.year and self.km and self.brand and self.model:
             logger.debug(f"  ✅ Volledige data aanwezig")
             
@@ -779,17 +778,30 @@ class Listing:
             logger.debug(f"  🎯 Deal quality: {self.deal_quality.value}")
                 
         else:
+            # ✅ AANGEPAST: Betere fallback logica
             logger.debug(f"  ⚠️  Incomplete data (jaar={self.year}, km={self.km}, brand={self.brand}, model={self.model})")
             
-            if self.km and self.price / self.km < 0.05:
-                logger.debug(f"  ✅ Extreem lage €/km: €{self.price/self.km:.2f}")
-                self.deal_quality = DealQuality.AVERAGE
-            elif self.price < 1000 and not self.is_dealer:
+            # Extreem lage prijs - altijd interessant
+            if self.price < 800:
                 logger.debug(f"  ✅ Extreem lage prijs: €{self.price}")
                 self.deal_quality = DealQuality.AVERAGE
-            else:
-                logger.debug(f"  ❌ GEBLOKKEERD: Incomplete data + geen speciale voorwaarden")
-                self.deal_quality = DealQuality.POOR
+                return
+            
+            # Zeer lage €/km (maar alleen als KM bekend is)
+            if self.km and self.price / self.km < 0.10:
+                logger.debug(f"  ✅ Extreem lage €/km: €{self.price/self.km:.2f}")
+                self.deal_quality = DealQuality.AVERAGE
+                return
+            
+            # Gemotiveerde verkoper zonder veel data?
+            if self.motivated_seller and self.price < 5000:
+                logger.debug(f"  ✅ Gemotiveerde verkoper + lage prijs")
+                self.deal_quality = DealQuality.WATCHLIST
+                return
+            
+            # Anders: te incomplete
+            logger.debug(f"  ❌ GEBLOKKEERD: Incomplete data + geen deal conditions")
+            self.deal_quality = DealQuality.POOR
 
         logger.debug(f"{'='*60}\n")
 
@@ -1115,10 +1127,11 @@ class ListingParser:
 
     @staticmethod
     def extract_km(text: str) -> Optional[int]:
+        # ✅ AANGEPAST: Betere KM extractie
         patterns = [
-            r'(\d{1,3}(?:[.,\s]\d{3})+)\s*km',
-            r'(\d{4,6})\s*km',
-            r'km[:\s]+(\d{1,3}(?:[.,\s]\d{3})+)',
+            r'(\d{1,3}(?:[.,\s]\d{3})*)\s*km\b',
+            r'km[:\s]*(\d{1,3}(?:[.,\s]\d{3})*)',
+            r'\b(\d{4,6})\s*km\b',
         ]
 
         for pattern in patterns:
@@ -1127,7 +1140,7 @@ class ListingParser:
                 raw = re.sub(r'[.,\s]', '', match.group(1))
                 try:
                     km = int(raw)
-                    if 100 < km < 500_000:
+                    if 50 < km < 500_000:  # ✅ AANGEPAST: van 100 naar 50
                         logger.debug(f"  📏 KM extracted: {km:,}")
                         return km
                 except ValueError:
@@ -1775,7 +1788,7 @@ class ProfitBot:
         
         app.add_handler(CommandHandler("start", commands.start))
         app.add_handler(CommandHandler("help", commands.help))
-        app.add_handler(CommandHandler("test", commands.test))  # NIEUW
+        app.add_handler(CommandHandler("test", commands.test))
         app.add_handler(CommandHandler("stats", commands.stats))
         app.add_handler(CommandHandler("pause", commands.pause))
         app.add_handler(CommandHandler("resume", commands.resume))
