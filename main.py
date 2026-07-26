@@ -44,17 +44,18 @@ class BotConfig:
     """Opstart-configuratie, geladen uit env vars. Onveranderlijk tijdens runtime."""
     telegram_token: str
     telegram_chat_id: str
-    check_interval: int = 8
-    max_concurrent_requests: int = 8
+    check_interval: int = 20
+    max_concurrent_requests: int = 5
     request_timeout: int = 15
     max_retries: int = 3
 
     min_profit_margin: int = 500
     max_km: int = 220_000
-    price_per_km_limit: float = 0.15  # sanity-check, geen hoofdfilter meer
+    price_per_km_limit: float = 0.15  # sanity-check, geen hoofdfilter
     seen_max_age_days: int = 30
 
-    market_value_samples: int = 30
+    market_value_samples: int = 50
+    market_pool_ttl_hours: int = 4
 
     seen_file: Path = field(default_factory=lambda: Path("seen_links.json"))
 
@@ -69,11 +70,12 @@ class BotConfig:
         return cls(
             telegram_token=token,
             telegram_chat_id=chat_id,
-            check_interval=int(os.getenv("CHECK_INTERVAL", 8)),
+            check_interval=int(os.getenv("CHECK_INTERVAL", 20)),
             min_profit_margin=int(os.getenv("MIN_PROFIT_MARGIN", 500)),
             max_km=int(os.getenv("MAX_KM", 220_000)),
             price_per_km_limit=float(os.getenv("PRICE_PER_KM_LIMIT", 0.15)),
-            market_value_samples=int(os.getenv("MARKET_VALUE_SAMPLES", 30)),
+            market_value_samples=int(os.getenv("MARKET_VALUE_SAMPLES", 50)),
+            market_pool_ttl_hours=int(os.getenv("MARKET_POOL_TTL_HOURS", 4)),
         )
 
 
@@ -81,8 +83,8 @@ class BotConfig:
 class RuntimeSettings:
     """
     Aanpasbare instellingen tijdens het draaien van de bot.
-    Wordt bij elke wijziging opgeslagen in runtime_settings.json
-    zodat /pause en /settings een herstart overleven.
+    Wordt bij elke wijziging opgeslagen zodat /pause en /settings
+    een herstart overleven.
     """
     min_profit_margin: int
     max_km: int
@@ -267,22 +269,110 @@ class RDWClient:
 
 # ---------------------------------------------------------
 # MARKET VALUE CALCULATOR
-# Gebruikt Marktplaats zelf als vergelijkingsmateriaal i.p.v.
-# AutoScout24 (die structureel blokkeerde met 403's). Dit
-# hergebruikt de search-endpoint die al bewezen betrouwbaar werkt.
+#
+# Werkt nu met ÉÉN brede steekproef per model (tot 50 advertenties),
+# gecached voor enkele uren, in plaats van een aparte, smalle
+# zoekopdracht per individuele listing. Dit voorkomt zowel:
+#  1) "0 vergelijkbare advertenties" (door te weinig data per query)
+#  2) Marktplaats-blokkades (door te veel losse requests)
+#
+# Matching gebeurt progressief breder, met een heuristische fallback
+# als er letterlijk geen directe matches te vinden zijn.
 # ---------------------------------------------------------
 
 class MarketValueCalculator:
 
-    def __init__(self, samples: int = 30):
-        self._cache: Dict[str, Tuple[Optional[float], datetime]] = {}
-        self._success_ttl = timedelta(hours=6)
-        self._fail_ttl = timedelta(minutes=15)
+    def __init__(self, samples: int = 50, pool_ttl_hours: int = 4):
+        self._pool_cache: Dict[str, Tuple[List[dict], datetime]] = {}
+        self._pool_ttl = timedelta(hours=pool_ttl_hours)
         self._samples = samples
 
-    def _get_cache_key(self, search_term: str, year: int, km: int) -> str:
-        km_bracket = (km // 20000) * 20000
-        return f"{search_term}_{year}_{km_bracket}"
+    @staticmethod
+    def _extract_all_text(item: dict) -> str:
+        """
+        Verzamelt tekst uit meerdere velden van een advertentie
+        (titel, beschrijving, eventuele attributen) zodat jaar/km
+        niet alleen uit de titel gehaald hoeft te worden — die
+        bevat dat vaak niet.
+        """
+        parts = [str(item.get('title', '')), str(item.get('description', ''))]
+
+        for attr_key in ('attributes', 'specificAttributes', 'specifics'):
+            attrs = item.get(attr_key)
+            if isinstance(attrs, list):
+                for attr in attrs:
+                    if isinstance(attr, dict):
+                        parts.append(str(attr.get('value', '')))
+                        parts.append(str(attr.get('key', '')))
+                    else:
+                        parts.append(str(attr))
+
+        return " ".join(parts)
+
+    async def _get_pool(self, search_term: str, client: 'SmartClient') -> List[dict]:
+        if search_term in self._pool_cache:
+            pool, timestamp = self._pool_cache[search_term]
+            if datetime.now() - timestamp < self._pool_ttl:
+                return pool
+
+        search_url = (
+            f"https://www.marktplaats.nl/lrp/api/search?"
+            f"query={search_term}&searchInTitleAndDescription=true&limit={self._samples}"
+        )
+
+        raw = await client.get_html(search_url)
+
+        if not raw:
+            # Bij falen: gebruik eventueel oude (verlopen) cache liever
+            # dan niets, om extra requests te vermijden tijdens problemen.
+            if search_term in self._pool_cache:
+                logger.debug(f"Pool-fetch mislukt voor {search_term}, gebruik oude cache")
+                return self._pool_cache[search_term][0]
+            return []
+
+        try:
+            data = json.loads(raw)
+            listings = data.get('listings', [])
+        except Exception as e:
+            logger.debug(f"Pool parse error voor {search_term}: {e}")
+            return []
+
+        pool = []
+        for item in listings:
+            price_info = item.get('priceInfo', {})
+            raw_price = price_info.get('priceCents') or price_info.get('price')
+
+            if raw_price is None:
+                continue
+
+            try:
+                price = int(raw_price)
+            except (ValueError, TypeError):
+                continue
+
+            if price > PRICE_CENT_THRESHOLD:
+                price = price // 100
+
+            if not (300 < price < 50000):
+                continue
+
+            combined_text = self._extract_all_text(item)
+            item_year = ListingParser.extract_year(combined_text)
+            item_km = ListingParser.extract_km(combined_text)
+            vip_url = item.get('vipUrl', '')
+            full_url = f"https://www.marktplaats.nl{vip_url}" if vip_url else ""
+
+            pool.append({
+                'price': price,
+                'year': item_year,
+                'km': item_km,
+                'url': full_url,
+            })
+
+        self._pool_cache[search_term] = (pool, datetime.now())
+        logger.debug(f"📦 Pool opgebouwd voor {search_term}: {len(pool)} bruikbare advertenties")
+
+        return pool
 
     async def get_market_value(
         self,
@@ -291,92 +381,63 @@ class MarketValueCalculator:
         km: int,
         exclude_url: str,
         client: 'SmartClient',
-    ) -> Optional[float]:
+    ) -> Tuple[Optional[float], bool]:
         """
-        Zoekt vergelijkbare advertenties op Marktplaats zelf
-        (zelfde zoekterm, bouwjaar ±1, km ±30.000) en berekent
-        de mediaanprijs als marktwaarde-indicatie.
+        Retourneert (marktwaarde, is_geschat).
+        is_geschat=True betekent: geen directe matches gevonden,
+        waarde is een ruwe schatting o.b.v. de hele steekproef.
         """
 
-        cache_key = self._get_cache_key(search_term, year, km)
+        raw_pool = await self._get_pool(search_term, client)
+        pool = [p for p in raw_pool if p['url'] != exclude_url]
 
-        if cache_key in self._cache:
-            value, timestamp = self._cache[cache_key]
-            ttl = self._success_ttl if value is not None else self._fail_ttl
-            if datetime.now() - timestamp < ttl:
-                return value
+        if not pool:
+            return None, False
 
-        search_url = (
-            f"https://www.marktplaats.nl/lrp/api/search?"
-            f"query={search_term}&searchInTitleAndDescription=true&limit={self._samples}"
-        )
+        # Progressief breder vergelijken
+        tolerances = [(1, 30_000), (2, 60_000), (3, 100_000)]
+        for year_tol, km_tol in tolerances:
+            matches = [
+                p['price'] for p in pool
+                if p['year'] is not None and p['km'] is not None
+                and abs(p['year'] - year) <= year_tol
+                and abs(p['km'] - km) <= km_tol
+            ]
+            if len(matches) >= MIN_COMPARISON_SAMPLES:
+                value = statistics.median(matches)
+                logger.info(
+                    f"💰 Marktwaarde {search_term} {year}: €{value:.0f} "
+                    f"(van {len(matches)} directe matches, ±{year_tol}j/±{km_tol}km)"
+                )
+                return value, False
 
-        raw = await client.get_html(search_url)
-        if not raw:
-            self._cache[cache_key] = (None, datetime.now())
-            return None
-
-        try:
-            data = json.loads(raw)
-            listings = data.get('listings', [])
-        except Exception as e:
-            logger.debug(f"Marktplaats vergelijk parse error: {e}")
-            self._cache[cache_key] = (None, datetime.now())
-            return None
-
-        prices = []
-        for item in listings:
-            vip_url = item.get('vipUrl', '')
-            full_url = f"https://www.marktplaats.nl{vip_url}"
-            if full_url == exclude_url:
-                continue  # tel de eigen advertentie niet mee
-
-            title = item.get('title', '')
-            price_info = item.get('priceInfo', {})
-            raw_price = price_info.get('priceCents') or price_info.get('price')
-
-            if raw_price is None:
-                continue
-
-            try:
-                item_price = int(raw_price)
-            except (ValueError, TypeError):
-                continue
-
-            if item_price > PRICE_CENT_THRESHOLD:
-                item_price = item_price // 100
-
-            item_year = ListingParser.extract_year(title)
-            item_km = ListingParser.extract_km(title)
-
-            if not item_year or not item_km:
-                continue
-
-            if abs(item_year - year) > 1:
-                continue
-            if abs(item_km - km) > 30000:
-                continue
-
-            if 300 < item_price < 50000:
-                prices.append(item_price)
-
-        if len(prices) < MIN_COMPARISON_SAMPLES:
-            self._cache[cache_key] = (None, datetime.now())
+        # Fallback: ruwe schatting o.b.v. hele pool + jaar-correctie
+        priced = [p for p in pool if p['price'] is not None]
+        if len(priced) < MIN_COMPARISON_SAMPLES:
             logger.warning(
-                f"⚠️  Te weinig vergelijkbare advertenties ({len(prices)}) "
-                f"voor {search_term} {year}"
+                f"⚠️  Te weinig data ({len(priced)}) voor {search_term} {year}, ook voor schatting"
             )
-            return None
+            return None, False
 
-        market_value = statistics.median(prices)
-        self._cache[cache_key] = (market_value, datetime.now())
+        base_median = statistics.median([p['price'] for p in priced])
+        years_known = [p['year'] for p in priced if p['year'] is not None]
+
+        if years_known:
+            avg_year = statistics.mean(years_known)
+            year_diff = year - avg_year
+            # Ruwe vuistregel: ~8% waardevermindering per jaar ouder
+            adjustment = 1 + (year_diff * 0.08)
+            adjustment = max(0.3, min(1.5, adjustment))
+            estimate = base_median * adjustment
+        else:
+            estimate = base_median
 
         logger.info(
-            f"💰 Marktwaarde {search_term} {year} (MP-vergelijk): "
-            f"€{market_value:.0f} (van {len(prices)} advertenties)"
+            f"💰 Marktwaarde {search_term} {year} (RUWE SCHATTING): €{estimate:.0f} "
+            f"(basis: {len(priced)} advertenties, geen directe match)"
         )
 
-        return market_value
+        return estimate, True
 
 # ---------------------------------------------------------
 # DATACLASSES
@@ -389,13 +450,15 @@ class MarketAnalysis:
     profit_potential: Optional[int]
     profit_percentage: Optional[float]
     is_profitable: bool
+    is_estimated: bool = False
 
     @classmethod
     def analyze(
         cls,
         asking_price: int,
         market_value: Optional[float],
-        min_profit: int
+        min_profit: int,
+        is_estimated: bool = False,
     ) -> 'MarketAnalysis':
 
         if not market_value:
@@ -404,7 +467,8 @@ class MarketAnalysis:
                 market_value=None,
                 profit_potential=None,
                 profit_percentage=None,
-                is_profitable=False
+                is_profitable=False,
+                is_estimated=is_estimated,
             )
 
         sell_price = market_value * 0.90
@@ -416,7 +480,8 @@ class MarketAnalysis:
             market_value=market_value,
             profit_potential=profit,
             profit_percentage=profit_pct,
-            is_profitable=profit >= min_profit
+            is_profitable=profit >= min_profit,
+            is_estimated=is_estimated,
         )
 
 @dataclass
@@ -543,15 +608,13 @@ class Listing:
             self.deal_quality = DealQuality.POOR
             return
 
-        # Losse sanity-check, geen hoofdfilter meer. De marktwaarde-
-        # vergelijking hieronder doet het eigenlijke werk.
         if self.price / self.km > settings.price_per_km_limit:
             self.deal_quality = DealQuality.POOR
             return
 
         search_term = self.search_term or (self.model.lower() if self.model else "")
 
-        market_value = await market_calculator.get_market_value(
+        market_value, is_estimated = await market_calculator.get_market_value(
             search_term,
             self.year,
             self.km,
@@ -562,7 +625,8 @@ class Listing:
         self.market_analysis = MarketAnalysis.analyze(
             self.price,
             market_value,
-            settings.min_profit_margin
+            settings.min_profit_margin,
+            is_estimated,
         )
 
         if not self.market_analysis.is_profitable:
@@ -612,12 +676,17 @@ class Listing:
             profit_pct = self.market_analysis.profit_percentage
             market_val = self.market_analysis.market_value
 
+            estimate_note = ""
+            if self.market_analysis.is_estimated:
+                estimate_note = "\n⚠️ Ruwe schatting (weinig directe vergelijkingen)"
+
             market_info = (
                 f"\n\n💰 WINST ANALYSE (o.b.v. vergelijkbare MP-advertenties):\n"
                 f"├─ Vraagprijs: €{self.price:,}\n"
                 f"├─ Marktwaarde: €{market_val:,.0f}\n"
                 f"├─ Verkoopprijs*: €{market_val * 0.9:,.0f}\n"
-                f"└─ Winst: €{profit:,} ({profit_pct:.0f}%)\n"
+                f"└─ Winst: €{profit:,} ({profit_pct:.0f}%)"
+                f"{estimate_note}\n"
                 f"\n*Na 10% kosten (reparatie/APK/verkoop)"
             )
 
@@ -717,6 +786,9 @@ class SmartClient:
         self._ua_index = 0
         self._domain_delays: Dict[str, datetime] = {}
         self._domain_locks: Dict[str, asyncio.Lock] = {}
+        # Gedeelde cooldown per domein: voorkomt dat meerdere gelijktijdige
+        # requests een geblokkeerd domein blijven hameren tijdens een block.
+        self._domain_block_until: Dict[str, datetime] = {}
 
     def _rotate_ua(self) -> str:
         ua = self.USER_AGENTS[self._ua_index]
@@ -739,8 +811,8 @@ class SmartClient:
         async with lock:
             if domain in self._domain_delays:
                 elapsed = (datetime.now() - self._domain_delays[domain]).total_seconds()
-                if elapsed < 1.5:
-                    await asyncio.sleep(1.5 - elapsed)
+                if elapsed < 2.5:
+                    await asyncio.sleep(2.5 - elapsed)
             self._domain_delays[domain] = datetime.now()
 
     async def __aenter__(self):
@@ -762,6 +834,14 @@ class SmartClient:
         if not self._session:
             raise RuntimeError("Client niet geïnitialiseerd")
 
+        domain = self._get_domain(url)
+
+        block_until = self._domain_block_until.get(domain)
+        if block_until and datetime.now() < block_until:
+            wait = (block_until - datetime.now()).total_seconds()
+            logger.debug(f"⏳ {domain} nog in cooldown, wacht {wait:.0f}s")
+            await asyncio.sleep(wait)
+
         await self._rate_limit(url)
 
         async with self._semaphore:
@@ -781,11 +861,13 @@ class SmartClient:
 
                     async with self._session.get(url, headers=headers) as response:
                         if response.status == 200:
+                            self._domain_block_until.pop(domain, None)
                             return await response.text()
                         elif response.status == 403:
                             self._stats["blocked"] += 1
                             wait = min(2 ** attempt * 3, 30)
-                            logger.warning(f"🚫 Blocked, wacht {wait}s")
+                            self._domain_block_until[domain] = datetime.now() + timedelta(seconds=wait)
+                            logger.warning(f"🚫 Blocked ({domain}), wacht {wait}s")
                             await asyncio.sleep(wait)
                         elif response.status in (429, 503):
                             wait = 2 ** attempt
@@ -839,9 +921,6 @@ class ListingParser:
             except Exception as e:
                 logger.debug(f"JSON parse mislukt, val terug op regex: {e}")
 
-        # Fallback: als __NEXT_DATA__ ontbreekt of anders is opgebouwd,
-        # probeer via simpele regex title/price te halen zodat de
-        # listing niet stilzwijgend genegeerd wordt.
         title_match = re.search(r'<title>(.*?)</title>', html)
         price_match = re.search(r'"price(?:Cents)?"\s*:\s*"?(\d+)"?', html)
 
@@ -974,12 +1053,16 @@ class ProfitScraper:
         filter_config: FilterConfig,
         seen_manager: SeenLinksManager,
         settings: RuntimeSettings,
-        market_samples: int = 30,
+        market_samples: int = 50,
+        market_pool_ttl_hours: int = 4,
     ):
         self.filter_config = filter_config
         self.seen_manager = seen_manager
         self.settings = settings
-        self.market_calculator = MarketValueCalculator(samples=market_samples)
+        self.market_calculator = MarketValueCalculator(
+            samples=market_samples,
+            pool_ttl_hours=market_pool_ttl_hours,
+        )
         self.rdw_client = RDWClient()
         self.rss_monitor = MarktplaatsRSSMonitor(filter_config)
 
@@ -1011,8 +1094,6 @@ class ProfitScraper:
             await self.seen_manager.add(url)
             return None
 
-        # Eerst proberen op titel+beschrijving (schoner), pas daarna
-        # als laatste redmiddel op de volledige ruwe HTML.
         km = ListingParser.extract_km(f"{title} {description}")
         if km is None:
             km = ListingParser.extract_km(html)
@@ -1436,6 +1517,7 @@ class ProfitBot:
             self.seen_manager,
             self.settings,
             self.bot_config.market_value_samples,
+            self.bot_config.market_pool_ttl_hours,
         )
 
         commands = BotCommands(self.notifier, self.scraper, self.settings, self.bot_config)
