@@ -6,6 +6,9 @@ import aiohttp
 import re
 import signal
 import statistics
+import atexit
+import urllib.request
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, List, Set, Tuple
@@ -26,6 +29,8 @@ class DealQuality(Enum):
     POOR = "POOR"
 
 PRICE_CENT_THRESHOLD = 100_000
+
+KENTEKEN_PATTERN = re.compile(r'\b([A-Za-z0-9]{1,3}-[A-Za-z0-9]{1,3}-[A-Za-z0-9]{1,3})\b')
 
 # ---------------------------------------------------------
 # CONFIG MANAGEMENT
@@ -103,7 +108,9 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger("profit-bot")
     logger.setLevel(level)
 
-    console_handler = logging.StreamHandler()
+    # Expliciet naar stdout, anders kleurt je hosting-platform INFO-logs
+    # per ongeluk rood (StreamHandler gaat standaard naar stderr).
+    console_handler = logging.StreamHandler(stream=sys.stdout)
     console_handler.setFormatter(
         ColoredFormatter("%(asctime)s [%(levelname)s] %(message)s")
     )
@@ -120,19 +127,116 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
 logger = setup_logging()
 
 # ---------------------------------------------------------
-# MARKET VALUE CALCULATOR (FIXED: fail-cache + circuit breaker)
+# SHUTDOWN NOTIFICATIE (werkt altijd, ook bij crash/herstart)
+# ---------------------------------------------------------
+
+_shutdown_notified = False
+
+def notify_shutdown_sync(token: str, chat_id: str, reason: str = "Bot is gestopt"):
+    """
+    Synchrone, dependency-lichte melding via de Telegram HTTP API.
+    Gebruikt geen asyncio/aiohttp zodat dit ook werkt tijdens
+    process-afsluiting of vanuit een except-block bij een crash.
+    """
+    global _shutdown_notified
+    if _shutdown_notified:
+        return
+    _shutdown_notified = True
+
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        text = (
+            f"🛑 {reason}\n"
+            f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"⚠️ De bot zoekt niet meer verder naar deals."
+        )
+        data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+        req = urllib.request.Request(url, data=data)
+        urllib.request.urlopen(req, timeout=10)
+        logger.info("📤 Shutdown-notificatie verstuurd")
+    except Exception as e:
+        logger.error(f"Kon shutdown-notificatie niet versturen: {e}")
+
+
+# ---------------------------------------------------------
+# RDW KENTEKEN CHECK (gratis, publieke overheids-API)
+# ---------------------------------------------------------
+
+def extract_kenteken(text: str) -> Optional[str]:
+    """
+    Probeert een Nederlands kenteken uit tekst te halen.
+    Werkt alleen als de verkoper het kenteken zelf in de
+    titel/beschrijving heeft gezet (niet altijd het geval).
+    """
+    match = KENTEKEN_PATTERN.search(text)
+    if not match:
+        return None
+
+    candidate = match.group(1).replace('-', '').replace(' ', '').upper()
+
+    if 5 <= len(candidate) <= 6 and any(c.isdigit() for c in candidate) and any(c.isalpha() for c in candidate):
+        return candidate
+
+    return None
+
+
+class RDWClient:
+    """
+    Client voor de gratis, publieke RDW open data API.
+    Geen bot-detectie, geen rate-limit problemen zoals bij AutoScout24 —
+    dit is officiële overheidsdata voor voertuiginformatie (geen prijzen).
+    """
+
+    BASE_URL = "https://opendata.rdw.nl/resource/m9d7-ebf2.json"
+
+    def __init__(self):
+        self._cache: Dict[str, Optional[dict]] = {}
+
+    async def lookup(self, kenteken: str, client: 'SmartClient') -> Optional[dict]:
+        kenteken = kenteken.upper().replace('-', '').replace(' ', '')
+
+        if kenteken in self._cache:
+            return self._cache[kenteken]
+
+        url = f"{self.BASE_URL}?kenteken={kenteken}"
+        raw = await client.get_html(url)
+
+        if not raw:
+            self._cache[kenteken] = None
+            return None
+
+        try:
+            results = json.loads(raw)
+            if not results:
+                self._cache[kenteken] = None
+                return None
+
+            info = results[0]
+            self._cache[kenteken] = info
+            logger.info(
+                f"🪪 RDW check OK: {kenteken} → "
+                f"{info.get('merk', '?')} {info.get('handelsbenaming', '?')}"
+            )
+            return info
+
+        except Exception as e:
+            logger.debug(f"RDW parse error: {e}")
+            self._cache[kenteken] = None
+            return None
+
+
+# ---------------------------------------------------------
+# MARKET VALUE CALCULATOR (fail-cache + circuit breaker)
 # ---------------------------------------------------------
 
 class MarketValueCalculator:
     """Bereken marktwaarde op basis van vergelijkbare auto's."""
 
     def __init__(self):
-        # value kan None zijn (= gefaalde lookup), timestamp altijd gezet
         self._cache: Dict[str, Tuple[Optional[float], datetime]] = {}
         self._success_ttl = timedelta(hours=6)
         self._fail_ttl = timedelta(minutes=15)
 
-        # Circuit breaker state
         self._consecutive_failures = 0
         self._circuit_open_until: Optional[datetime] = None
         self._failure_threshold = 5
@@ -146,7 +250,6 @@ class MarketValueCalculator:
         if self._circuit_open_until is None:
             return False
         if datetime.now() >= self._circuit_open_until:
-            # Cooldown voorbij, geef circuit weer een kans
             logger.info("🔌 Circuit breaker cooldown voorbij, probeer AutoScout24 weer")
             self._circuit_open_until = None
             self._consecutive_failures = 0
@@ -173,24 +276,16 @@ class MarketValueCalculator:
         km: int,
         client: 'SmartClient'
     ) -> Optional[float]:
-        """Bereken marktwaarde op basis van AutoScout24 data."""
 
         cache_key = self._get_cache_key(brand, model, year, km)
 
-        # Check cache (zowel succes als fail-cache)
         if cache_key in self._cache:
             value, timestamp = self._cache[cache_key]
             ttl = self._success_ttl if value is not None else self._fail_ttl
             if datetime.now() - timestamp < ttl:
-                if value is not None:
-                    logger.debug(f"💰 Cache hit voor {brand} {model} {year}: €{value:.0f}")
-                else:
-                    logger.debug(f"⏭️  Fail-cache hit voor {brand} {model} {year}, sla over")
                 return value
 
-        # Circuit breaker check: sla AutoScout24 volledig over als hij "uit" staat
         if self._circuit_is_open():
-            logger.debug(f"⏭️  Circuit open, skip AutoScout24 lookup voor {brand} {model}")
             self._cache[cache_key] = (None, datetime.now())
             return None
 
@@ -314,6 +409,9 @@ class Listing:
     market_analysis: Optional[MarketAnalysis] = field(default=None, init=False, repr=False)
     deal_quality: DealQuality = field(default=DealQuality.POOR, init=False, repr=False)
 
+    kenteken: Optional[str] = field(default=None, init=False, repr=False)
+    rdw_verified: bool = field(default=False, init=False, repr=False)
+
     def __post_init__(self):
         if self.price < 0:
             raise ValueError(f"Prijs kan niet negatief zijn: {self.price}")
@@ -353,11 +451,40 @@ class Listing:
             if len(words) > 1:
                 self.model = words[1]
 
+    async def _try_rdw_check(self, rdw_client: RDWClient, client: 'SmartClient') -> None:
+        """Best-effort kenteken check. Faalt stil als er geen kenteken in de tekst staat."""
+        kenteken = extract_kenteken(f"{self.title} {self.description}")
+        if not kenteken:
+            return
+
+        self.kenteken = kenteken
+        rdw_info = await rdw_client.lookup(kenteken, client)
+
+        if not rdw_info:
+            return
+
+        self.rdw_verified = True
+
+        rdw_date = rdw_info.get('datum_eerste_toelating')
+        if rdw_date and len(str(rdw_date)) >= 4:
+            try:
+                self.year = int(str(rdw_date)[:4])
+            except ValueError:
+                pass
+
+        rdw_brand = rdw_info.get('merk')
+        rdw_model = rdw_info.get('handelsbenaming')
+        if rdw_brand:
+            self.brand = rdw_brand.capitalize()
+        if rdw_model:
+            self.model = rdw_model.capitalize()
+
     async def analyze(
         self,
         filter_config: FilterConfig,
         bot_config: BotConfig,
         market_calculator: MarketValueCalculator,
+        rdw_client: RDWClient,
         client: 'SmartClient'
     ) -> None:
 
@@ -375,6 +502,9 @@ class Listing:
         if self.is_dealer or self.has_red_flags:
             self.deal_quality = DealQuality.POOR
             return
+
+        # Bonus: probeer kenteken te verifiëren via RDW (gratis, betrouwbaar)
+        await self._try_rdw_check(rdw_client, client)
 
         if not self.year or not self.km or not self.brand or not self.model:
             self.deal_quality = DealQuality.POOR
@@ -438,6 +568,8 @@ class Listing:
         if self.motivated_seller:
             urgency = "\n🚨 GEMOTIVEERDE VERKOPER!"
 
+        rdw_badge = "\n🪪 RDW geverifieerd ✅" if self.rdw_verified else ""
+
         quality_stars = "⭐" * min(self.quality_score, 5)
         quality_info = f"\n{quality_stars} Kwaliteit: {self.quality_score}/10" if self.quality_score > 0 else ""
 
@@ -467,7 +599,8 @@ class Listing:
             f"├─ Merk: {self.brand or '?'} {self.model or ''}\n"
             f"├─ Bouwjaar: {self.year}\n"
             f"├─ KM-stand: {km_str}\n"
-            f"└─ Gevonden: {time_posted}\n"
+            f"└─ Gevonden: {time_posted}"
+            f"{rdw_badge}"
             f"{market_info}"
             f"{quality_info}"
             f"{urgency}\n"
@@ -533,7 +666,7 @@ class SeenLinksManager:
             self._save()
 
 # ---------------------------------------------------------
-# HTTP CLIENT (FIXED: lock-based rate limiter)
+# HTTP CLIENT (lock-based rate limiter)
 # ---------------------------------------------------------
 
 class SmartClient:
@@ -572,7 +705,6 @@ class SmartClient:
         domain = self._get_domain(url)
         lock = self._get_domain_lock(domain)
 
-        # Lock zorgt dat gelijktijdige coroutines elkaar niet voorbijlopen
         async with lock:
             if domain in self._domain_delays:
                 elapsed = (datetime.now() - self._domain_delays[domain]).total_seconds()
@@ -800,6 +932,7 @@ class ProfitScraper:
         self.filter_config = filter_config
         self.seen_manager = seen_manager
         self.market_calculator = MarketValueCalculator()
+        self.rdw_client = RDWClient()
         self.rss_monitor = MarktplaatsRSSMonitor(filter_config)
 
         self._stats = {
@@ -845,6 +978,7 @@ class ProfitScraper:
                 self.filter_config,
                 self.bot_config,
                 self.market_calculator,
+                self.rdw_client,
                 client
             )
 
@@ -1043,6 +1177,16 @@ def main():
     try:
         bot_config = BotConfig.from_env()
         filter_config = FilterConfig.from_file(Path("filters.json"))
+
+        # Zorgt dat je ALTIJD een Telegram-melding krijgt zodra het
+        # proces stopt (normale stop, crash, herstart door platform).
+        # Werkt niet bij een harde kill -9 / OOM-kill, want dat kan
+        # geen enkel Python-proces zelf nog opvangen.
+        atexit.register(
+            notify_shutdown_sync,
+            bot_config.telegram_token,
+            bot_config.telegram_chat_id,
+        )
 
         bot = ProfitBot(bot_config, filter_config)
         bot.run()
