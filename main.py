@@ -33,9 +33,7 @@ class DealQuality(Enum):
 
 PRICE_CENT_THRESHOLD = 100_000
 MIN_COMPARISON_SAMPLES = 1
-
 KENTEKEN_PATTERN = re.compile(r'\b([A-Za-z0-9]{1,3}-[A-Za-z0-9]{1,3}-[A-Za-z0-9]{1,3})\b')
-
 SETTINGS_FILE = Path("runtime_settings.json")
 
 # ---------------------------------------------------------
@@ -77,7 +75,6 @@ class ColoredFormatter(logging.Formatter):
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger("profit-bot")
     logger.setLevel(level)
-    
     logger.handlers = []
 
     console_handler = logging.StreamHandler(stream=sys.stdout)
@@ -114,15 +111,12 @@ class BotConfig:
     max_concurrent_requests: int = 5
     request_timeout: int = 15
     max_retries: int = 3
-
     min_profit_margin: int = 200
     max_km: int = 300_000
     price_per_km_limit: float = 0.20
     seen_max_age_days: int = 7
-
     market_value_samples: int = 100
     market_pool_ttl_hours: int = 2
-
     seen_file: Path = field(default_factory=lambda: Path("seen_links.json"))
 
     @classmethod
@@ -144,7 +138,6 @@ class BotConfig:
             market_pool_ttl_hours=int(os.getenv("MARKET_POOL_TTL_HOURS", 2)),
         )
 
-
 @dataclass
 class RuntimeSettings:
     min_profit_margin: int
@@ -152,7 +145,6 @@ class RuntimeSettings:
     price_per_km_limit: float
     check_interval: int
     paused: bool = False
-
 
 def load_runtime_settings(bot_config: BotConfig) -> RuntimeSettings:
     if SETTINGS_FILE.exists():
@@ -166,7 +158,7 @@ def load_runtime_settings(bot_config: BotConfig) -> RuntimeSettings:
                 paused=data.get("paused", False),
             )
         except Exception as e:
-            logger.warning(f"Kon runtime_settings.json niet laden: {e}")
+            logger.warning(f"⚠️ Kon runtime_settings.json niet laden: {e}")
 
     return RuntimeSettings(
         min_profit_margin=bot_config.min_profit_margin,
@@ -174,7 +166,6 @@ def load_runtime_settings(bot_config: BotConfig) -> RuntimeSettings:
         price_per_km_limit=bot_config.price_per_km_limit,
         check_interval=bot_config.check_interval,
     )
-
 
 def save_runtime_settings(settings: RuntimeSettings):
     try:
@@ -187,8 +178,7 @@ def save_runtime_settings(settings: RuntimeSettings):
         }
         SETTINGS_FILE.write_text(json.dumps(data, indent=2))
     except Exception as e:
-        logger.error(f"Kon runtime_settings.json niet opslaan: {e}")
-
+        logger.error(f"❌ Kon runtime_settings.json niet opslaan: {e}")
 
 @dataclass(frozen=True)
 class FilterConfig:
@@ -202,7 +192,7 @@ class FilterConfig:
     @classmethod
     def from_file(cls, path: Path) -> 'FilterConfig':
         if not path.exists():
-            raise FileNotFoundError(f"filters.json niet gevonden")
+            raise FileNotFoundError(f"❌ filters.json niet gevonden")
 
         data = json.loads(path.read_text())
         return cls(
@@ -215,7 +205,7 @@ class FilterConfig:
         )
 
 # ---------------------------------------------------------
-# SHUTDOWN NOTIFICATIE
+# SHUTDOWN
 # ---------------------------------------------------------
 
 _shutdown_notified = False
@@ -230,33 +220,27 @@ def notify_shutdown_sync(token: str, chat_id: str, reason: str = "Bot is gestopt
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         text = (
             f"🛑 {reason}\n"
-            f"📅 {datetime.now(ZoneInfo('Europe/Amsterdam')).strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"⚠️ De bot zoekt niet meer verder naar deals."
+            f"📅 {datetime.now(ZoneInfo('Europe/Amsterdam')).strftime('%Y-%m-%d %H:%M:%S')}"
         )
         data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
         req = urllib.request.Request(url, data=data)
         urllib.request.urlopen(req, timeout=10)
         logger.info("📤 Shutdown-notificatie verstuurd")
     except Exception as e:
-        logger.error(f"Kon shutdown-notificatie niet versturen: {e}")
-
+        logger.error(f"❌ Shutdown notification failed: {e}")
 
 # ---------------------------------------------------------
-# RDW KENTEKEN CHECK
+# RDW LOOKUP
 # ---------------------------------------------------------
 
 def extract_kenteken(text: str) -> Optional[str]:
     match = KENTEKEN_PATTERN.search(text)
     if not match:
         return None
-
     candidate = match.group(1).replace('-', '').replace(' ', '').upper()
-
     if 5 <= len(candidate) <= 6 and any(c.isdigit() for c in candidate) and any(c.isalpha() for c in candidate):
         return candidate
-
     return None
-
 
 class RDWClient:
     BASE_URL = "https://opendata.rdw.nl/resource/m9d7-ebf2.json"
@@ -285,17 +269,14 @@ class RDWClient:
 
             info = results[0]
             self._cache[kenteken] = info
-            logger.info(f"✅ RDW: {kenteken} → {info.get('merk', '?')} {info.get('handelsbenaming', '?')}")
             return info
-
         except Exception as e:
-            logger.debug(f"RDW parse error: {e}")
+            logger.debug(f"RDW error: {e}")
             self._cache[kenteken] = None
             return None
 
-
 # ---------------------------------------------------------
-# PRICE HISTORY TRACKER
+# PRICE TRACKER
 # ---------------------------------------------------------
 
 class PriceHistoryTracker:
@@ -306,14 +287,12 @@ class PriceHistoryTracker:
         if url not in self._history:
             self._history[url] = []
         self._history[url].append((datetime.now(), price))
-        
         if len(self._history[url]) > 10:
             self._history[url] = self._history[url][-10:]
     
     def price_dropped(self, url: str, current_price: int) -> Optional[int]:
         if url not in self._history or len(self._history[url]) < 2:
             return None
-        
         previous_price = self._history[url][-2][1]
         drop = previous_price - current_price
         return drop if drop > 0 else None
@@ -328,13 +307,11 @@ class PriceHistoryTracker:
             if not self._history[url]:
                 del self._history[url]
 
-
 # ---------------------------------------------------------
 # MARKET VALUE CALCULATOR
 # ---------------------------------------------------------
 
 class MarketValueCalculator:
-
     def __init__(self, samples: int = 100, pool_ttl_hours: int = 2):
         self._pool_cache: Dict[str, Tuple[List[dict], datetime]] = {}
         self._pool_ttl = timedelta(hours=pool_ttl_hours)
@@ -343,7 +320,6 @@ class MarketValueCalculator:
     @staticmethod
     def _extract_all_text(item: dict) -> str:
         parts = [str(item.get('title', '')), str(item.get('description', ''))]
-
         for attr_key in ('attributes', 'specificAttributes', 'specifics'):
             attrs = item.get(attr_key)
             if isinstance(attrs, list):
@@ -353,14 +329,13 @@ class MarketValueCalculator:
                         parts.append(str(attr.get('key', '')))
                     else:
                         parts.append(str(attr))
-
         return " ".join(parts)
 
     async def _get_pool(self, search_term: str, client: 'SmartClient') -> List[dict]:
         if search_term in self._pool_cache:
             pool, timestamp = self._pool_cache[search_term]
             if datetime.now() - timestamp < self._pool_ttl:
-                logger.info(f"📦 Pool cache hit voor '{search_term}'")
+                logger.info(f"📦 Pool cache hit")
                 return pool
 
         search_url = (
@@ -368,22 +343,20 @@ class MarketValueCalculator:
             f"query={search_term}&searchInTitleAndDescription=true&limit={self._samples}"
         )
 
-        logger.info(f"🔍 Ophalen marktwaarde pool voor '{search_term}'...")
+        logger.info(f"🔍 Pool ophalen voor '{search_term}'...")
         raw = await client.get_html(search_url)
 
         if not raw:
             if search_term in self._pool_cache:
-                logger.info(f"Pool-fetch mislukt, gebruik oude cache")
                 return self._pool_cache[search_term][0]
-            logger.warning(f"❌ Kon pool niet ophalen voor '{search_term}'")
+            logger.warning(f"❌ Pool ophalen mislukt")
             return []
 
         try:
             data = json.loads(raw)
             listings = data.get('listings', [])
-            logger.info(f"📊 {len(listings)} listings gevonden voor marktwaarde")
         except Exception as e:
-            logger.error(f"Pool parse error voor '{search_term}': {e}")
+            logger.error(f"❌ Pool parse error: {e}")
             return []
 
         pool = []
@@ -419,8 +392,6 @@ class MarketValueCalculator:
             })
 
         self._pool_cache[search_term] = (pool, datetime.now())
-        logger.info(f"✅ Pool: {len(pool)} bruikbare advertenties voor '{search_term}'")
-
         return pool
 
     async def get_market_value(
@@ -436,10 +407,7 @@ class MarketValueCalculator:
         pool = [p for p in raw_pool if p['url'] != exclude_url]
 
         if not pool:
-            logger.warning(f"❌ Geen pool data voor '{search_term}'")
             return None, False
-
-        logger.info(f"🔎 Zoek marktwaarde: {search_term} {year} ({km:,} km)")
 
         tolerances = [(2, 50_000), (3, 80_000), (5, 120_000), (10, 200_000)]
         
@@ -453,15 +421,10 @@ class MarketValueCalculator:
             
             if len(matches) >= MIN_COMPARISON_SAMPLES:
                 value = statistics.median(matches)
-                logger.info(
-                    f"💰 Marktwaarde: €{value:.0f} ({len(matches)} matches, ±{year_tol}j/±{km_tol}km)"
-                )
                 return value, False
 
-        # Fallback
         priced = [p for p in pool if p['price'] is not None]
         if len(priced) < 3:
-            logger.warning(f"⚠️  Te weinig data ({len(priced)}) voor marktwaarde")
             return None, False
 
         base_median = statistics.median([p['price'] for p in priced])
@@ -475,8 +438,6 @@ class MarketValueCalculator:
             estimate = base_median * adjustment
         else:
             estimate = base_median
-
-        logger.info(f"💰 Marktwaarde SCHATTING: €{estimate:.0f} ({len(priced)} auto's)")
 
         return estimate, True
 
@@ -555,17 +516,16 @@ class Listing:
 
     kenteken: Optional[str] = field(default=None, init=False, repr=False)
     rdw_verified: bool = field(default=False, init=False, repr=False)
-    
     is_urgent: bool = field(default=False, init=False, repr=False)
     price_drop: Optional[int] = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.price < 0:
-            raise ValueError(f"Prijs kan niet negatief zijn: {self.price}")
+            raise ValueError(f"Prijs kan niet negatief zijn")
         if self.km is not None and self.km < 0:
-            raise ValueError(f"KM kan niet negatief zijn: {self.km}")
+            raise ValueError(f"KM kan niet negatief zijn")
         if self.year is not None and (self.year < 1990 or self.year > datetime.now().year + 1):
-            raise ValueError(f"Ongeldig bouwjaar: {self.year}")
+            raise ValueError(f"Ongeldig bouwjaar")
 
         if not self.brand or not self.model:
             self._extract_brand_model()
@@ -600,17 +560,9 @@ class Listing:
 
     def detect_urgency(self) -> bool:
         urgency_signals = [
-            r'snel\s+weg',
-            r'deze\s+week',
-            r'vandaag\s+nog',
-            r'moet\s+weg',
-            r'emigratie',
-            r'inruil',
-            r'ruimte\s+nodig',
-            r'heden',
-            r'spoedverkoop',
-            r'direct',
-            r'vanavond',
+            r'snel\s+weg', r'deze\s+week', r'vandaag\s+nog', r'moet\s+weg',
+            r'emigratie', r'inruil', r'ruimte\s+nodig', r'heden',
+            r'spoedverkoop', r'direct', r'vanavond',
         ]
         text = f"{self.title} {self.description}".lower()
         return any(re.search(signal, text) for signal in urgency_signals)
@@ -651,14 +603,10 @@ class Listing:
         client: 'SmartClient'
     ) -> None:
 
-        logger.info(f"\n🔍 ANALYSEER: {self.title[:50]}...")
-        logger.info(f"   💶 €{self.price:,} | {self.km:,} km" if self.km else f"   💶 €{self.price:,} | ? km")
-
         combined_text = f"{self.title} {self.description}".lower()
 
-        # Dealer check - VEEL MINDER STRIKT
         dealer_matches = [word for word in filter_config.dealer_words if word in combined_text]
-        self.is_dealer = len(dealer_matches) >= 4  # ZEER STRIKT NU
+        self.is_dealer = len(dealer_matches) >= 4
         
         self.motivated_seller = any(word in combined_text for word in filter_config.motivation_words)
         
@@ -672,40 +620,27 @@ class Listing:
             if indicator in combined_text
         )
 
-        if self.is_dealer:
-            logger.info(f"   ❌ BLOKKADE: Dealer")
-            self.deal_quality = DealQuality.POOR
-            return
-            
-        if self.has_red_flags:
-            logger.info(f"   ❌ BLOKKADE: Red flags")
+        if self.is_dealer or self.has_red_flags:
             self.deal_quality = DealQuality.POOR
             return
 
         await self._try_rdw_check(rdw_client, client)
 
-        # VEEL SOEPELER CRITERIA!
         if self.year and self.km and self.brand and self.model:
             
             if self.km > settings.max_km:
-                logger.info(f"   ❌ BLOKKADE: KM te hoog")
                 self.deal_quality = DealQuality.POOR
                 return
 
             price_per_km = self.price / self.km
             if price_per_km > settings.price_per_km_limit:
-                logger.info(f"   ❌ BLOKKADE: €/km te hoog (€{price_per_km:.2f})")
                 self.deal_quality = DealQuality.POOR
                 return
 
             search_term = self.search_term or (self.model.lower() if self.model else "")
 
             market_value, is_estimated = await market_calculator.get_market_value(
-                search_term,
-                self.year,
-                self.km,
-                self.url,
-                client
+                search_term, self.year, self.km, self.url, client
             )
 
             adjusted_min_profit = settings.min_profit_margin
@@ -713,28 +648,18 @@ class Listing:
                 adjusted_min_profit = int(settings.min_profit_margin * 0.5)
 
             self.market_analysis = MarketAnalysis.analyze(
-                self.price,
-                market_value,
-                adjusted_min_profit,
-                is_estimated,
+                self.price, market_value, adjusted_min_profit, is_estimated,
             )
 
             if not self.market_analysis.is_profitable:
                 profit = self.market_analysis.profit_potential or 0
-                
-                # VEEL MEER WATCHLIST DEALS!
-                logger.info(f"   💔 Niet winstgevend: €{profit} < €{adjusted_min_profit}")
-                
                 if profit > 0:
                     self.deal_quality = DealQuality.WATCHLIST
-                    logger.info(f"   👀 WATCHLIST: €{profit} winst")
                     return
-                
                 self.deal_quality = DealQuality.POOR
                 return
 
             profit = self.market_analysis.profit_potential or 0
-            logger.info(f"   ✅ WINSTGEVEND: €{profit}")
 
             if profit >= 1500:
                 self.deal_quality = DealQuality.GODLIKE
@@ -746,28 +671,17 @@ class Listing:
                 self.deal_quality = DealQuality.AVERAGE
                 
         else:
-            # VEEL MINDER DATA NODIG!
-            logger.info(f"   ⚠️  Incomplete: jaar={self.year}, km={self.km}")
-            
-            # Alles onder €1500 is interessant
             if self.price < 1500:
-                logger.info(f"   ✅ WATCHLIST: Extreem lage prijs")
                 self.deal_quality = DealQuality.WATCHLIST
                 return
             
-            # Lage €/km (als bekend)
             if self.km and self.price / self.km < 0.12:
-                logger.info(f"   ✅ WATCHLIST: Lage €/km (€{self.price/self.km:.2f})")
                 self.deal_quality = DealQuality.WATCHLIST
                 return
             
-            # Gemotiveerde verkoper
             if self.motivated_seller and self.price < 3000:
-                logger.info(f"   ✅ WATCHLIST: Gemotiveerde verkoper")
                 self.deal_quality = DealQuality.WATCHLIST
                 return
-
-        logger.info(f"{'='*50}\n")
 
     @property
     def is_good_deal(self) -> bool:
@@ -868,9 +782,9 @@ class SeenLinksManager:
                 url: datetime.fromisoformat(ts)
                 for url, ts in raw_data.items()
             }
-            logger.info(f"✅ Geladen: {len(self._data)} geziene links")
+            logger.info(f"✅ Geladen: {len(self._data)} links")
         except Exception as e:
-            logger.warning(f"⚠️  Kon seen links niet laden: {e}")
+            logger.warning(f"⚠️ Kon seen links niet laden: {e}")
             self._data = {}
 
     def _save(self):
@@ -878,7 +792,7 @@ class SeenLinksManager:
             raw_data = {url: dt.isoformat() for url, dt in self._data.items()}
             self._path.write_text(json.dumps(raw_data, indent=2))
         except Exception as e:
-            logger.error(f"Save error: {e}")
+            logger.error(f"❌ Save error: {e}")
 
     def _clean_expired(self):
         cutoff = datetime.now() - self._max_age
@@ -886,7 +800,7 @@ class SeenLinksManager:
         self._data = {url: dt for url, dt in self._data.items() if dt > cutoff}
         removed = original - len(self._data)
         if removed > 0:
-            logger.info(f"🧹 Cleanup: {removed} oude links verwijderd")
+            logger.info(f"🧹 Cleanup: {removed} links verwijderd")
 
     async def contains(self, url: str) -> bool:
         async with self._lock:
@@ -907,8 +821,8 @@ class SeenLinksManager:
 
 class SmartClient:
     USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
     ]
 
@@ -953,7 +867,6 @@ class SmartClient:
             limit_per_host=2,
             ttl_dns_cache=300,
         )
-
         timeout = aiohttp.ClientTimeout(total=self.config.request_timeout)
         self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         return self
@@ -983,11 +896,7 @@ class SmartClient:
                     headers = {
                         "User-Agent": self._rotate_ua(),
                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
-                        "Accept-Encoding": "gzip, deflate, br",
-                        "DNT": "1",
-                        "Connection": "keep-alive",
-                        "Upgrade-Insecure-Requests": "1",
+                        "Accept-Language": "nl-NL,nl;q=0.9",
                     }
 
                     async with self._session.get(url, headers=headers, ssl=False) as response:
@@ -998,13 +907,9 @@ class SmartClient:
                             self._stats["blocked"] += 1
                             wait = min(2 ** attempt * 3, 60)
                             self._domain_block_until[domain] = datetime.now() + timedelta(seconds=wait)
-                            logger.warning(f"🚫 Blocked, wacht {wait}s...")
                             await asyncio.sleep(wait)
                         elif response.status in (429, 503):
-                            wait = 2 ** attempt
-                            await asyncio.sleep(wait)
-                        elif response.status == 404:
-                            return None
+                            await asyncio.sleep(2 ** attempt)
                         else:
                             return None
 
@@ -1047,10 +952,8 @@ class ListingParser:
                     price = int(raw_price)
                     if price > PRICE_CENT_THRESHOLD:
                         price = price // 100
-                    
                     return title, price, description
-
-            except Exception as e:
+            except Exception:
                 pass
 
         title_match = re.search(r'<title>(.*?)</title>', html)
@@ -1168,7 +1071,7 @@ class MarktplaatsRSSMonitor:
                 self._seen_items = set(list(self._seen_items)[-2500:])
 
         except Exception as e:
-            logger.error(f"RSS parse error: {e}")
+            logger.error(f"❌ RSS parse error: {e}")
 
         return new_listings
 
@@ -1290,7 +1193,7 @@ class ProfitScraper:
 
         logger.info(
             f"🎉 DEAL GEVONDEN: {listing.deal_quality.value} | "
-            f"€{profit} winst | {listing.brand} {listing.model}"
+            f"€{profit} winst"
         )
 
         return listing
@@ -1322,13 +1225,9 @@ class ProfitScraper:
             aliases = self.filter_config.model_aliases.get(model, [])
             all_search_terms.extend(aliases)
 
-        logger.info(f"🔎 Zoeken naar: {len(all_search_terms)} termen")
+        logger.info(f"🔎 {len(all_search_terms)} zoektermen")
 
-        tasks = [
-            self.scan_model(term, client)
-            for term in all_search_terms
-        ]
-
+        tasks = [self.scan_model(term, client) for term in all_search_terms]
         results = await asyncio.gather(*tasks)
         all_deals = [deal for model_deals in results for deal in model_deals]
 
@@ -1371,16 +1270,17 @@ class TelegramNotifier:
 
     async def send_message(self, message: str) -> bool:
         try:
-            await self.app.bot.send_message(
+            logger.info(f"📤 Telegram sturen ({len(message)} chars)...")
+            result = await self.app.bot.send_message(
                 chat_id=self.chat_id,
                 text=message,
                 disable_web_page_preview=True,
             )
             self._stats["sent"] += 1
-            logger.info(f"📤 Telegram message verzonden")
+            logger.info(f"✅ Telegram verzonden (ID: {result.message_id})")
             return True
         except Exception as e:
-            logger.error(f"Telegram error: {e}")
+            logger.error(f"❌ Telegram error: {e}")
             return False
 
     async def send_listing(self, listing: Listing) -> bool:
@@ -1390,7 +1290,7 @@ class TelegramNotifier:
         message = (
             "💰 PROFIT BOT ACTIEF\n\n"
             f"📅 {datetime.now(ZoneInfo('Europe/Amsterdam')).strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"🎯 Winst: €{min_profit}+\n"
+            f"🎯 Min. winst: €{min_profit}\n"
             "✅ Monitoring gestart"
         )
         return await self.send_message(message)
@@ -1440,8 +1340,7 @@ class BotCommands:
             "/stats - Bot statistieken\n"
             "/top - Top 5 deals\n"
             "/pause - Bot pauzeren\n"
-            "/resume - Bot hervatten\n"
-            "/settings - Instellingen"
+            "/resume - Bot hervatten"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -1495,18 +1394,17 @@ class BotCommands:
         for i, deal in enumerate(top_deals, start=1):
             profit = deal.market_analysis.profit_potential if deal.market_analysis else 0
             lines.append(
-                f"{i}. {deal.deal_quality.value}\n"
-                f"   €{profit:,} | {deal.brand} {deal.model}\n\n"
+                f"{i}. {deal.deal_quality.value} | €{profit:,}\n"
             )
 
         await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 # ---------------------------------------------------------
-# TELEGRAM ERROR HANDLER
+# ERROR HANDLER
 # ---------------------------------------------------------
 
 async def telegram_error_handler(update, context):
-    logger.error(f"Telegram error: {context.error}")
+    logger.error(f"❌ Telegram error: {context.error}")
 
 # ---------------------------------------------------------
 # MAIN BOT
@@ -1517,18 +1415,14 @@ class ProfitBot:
     def __init__(self, bot_config: BotConfig, filter_config: FilterConfig):
         self.bot_config = bot_config
         self.filter_config = filter_config
-
         self.settings = load_runtime_settings(bot_config)
-
         self.seen_manager = SeenLinksManager(
             bot_config.seen_file,
             bot_config.seen_max_age_days
         )
-
         self.scraper = None
         self.notifier = None
         self._shutdown = asyncio.Event()
-
         self._setup_signals()
 
     def _setup_signals(self):
@@ -1541,39 +1435,73 @@ class ProfitBot:
 
     async def _scan_loop(self):
         logger.info("🚀 Scan loop gestart")
-        await self.notifier.send_startup(self.settings.min_profit_margin)
+        
+        max_wait = 30
+        for i in range(max_wait):
+            if self.notifier is not None:
+                logger.info("✅ Notifier ready")
+                break
+            await asyncio.sleep(0.1)
+        else:
+            logger.error("❌ Notifier never initialized!")
+            return
+
+        startup_ok = await self.notifier.send_startup(self.settings.min_profit_margin)
+        if not startup_ok:
+            logger.error("❌ Startup message failed!")
+            return
+
+        logger.info("✅ Startup successful")
 
         async with SmartClient(self.bot_config) as client:
             while not self._shutdown.is_set():
 
                 if not self.settings.paused:
                     try:
+                        logger.info("📡 Scan starten...")
                         deals = await self.scraper.scan_all(client)
+                        
+                        logger.info(f"✅ {len(deals)} deals gevonden")
 
-                        for deal in deals:
-                            await self.notifier.send_listing(deal)
-                            await asyncio.sleep(0.5)
+                        if deals:
+                            logger.info(f"📤 Sturen naar Telegram...")
+                            for i, deal in enumerate(deals, 1):
+                                logger.info(f"   [{i}/{len(deals)}] {deal.title[:30]}...")
+                                sent = await self.notifier.send_listing(deal)
+                                if sent:
+                                    logger.info(f"   ✅ Verzonden!")
+                                else:
+                                    logger.error(f"   ❌ Verzenden mislukt!")
+                                await asyncio.sleep(1)
 
                         await self.seen_manager.cleanup_and_save()
 
                     except Exception as e:
-                        logger.exception(f"Scan error: {e}")
+                        logger.exception(f"❌ Scan error: {e}")
+                        await asyncio.sleep(5)
+
+                else:
+                    logger.info("⏸️ Bot is paused")
 
                 try:
+                    logger.info(f"⏰ Wachten {self.settings.check_interval}s...")
                     await asyncio.wait_for(
                         self._shutdown.wait(),
                         timeout=self.settings.check_interval
                     )
+                    logger.info("🛑 Shutdown signal")
                     break
                 except asyncio.TimeoutError:
                     pass
 
-        logger.info("🛑 Bot gestopt")
+        logger.info("🛑 Scan loop ended")
 
     async def _post_init(self, app):
-        logger.info("🔧 Bot initializing...")
+        logger.info("🔧 POST_INIT START")
         
         self.notifier = TelegramNotifier(app, self.bot_config.telegram_chat_id)
+        logger.info("✅ Notifier created")
+        
         self.scraper = ProfitScraper(
             self.filter_config,
             self.seen_manager,
@@ -1581,6 +1509,7 @@ class ProfitBot:
             self.bot_config.market_value_samples,
             self.bot_config.market_pool_ttl_hours,
         )
+        logger.info("✅ Scraper created")
 
         commands = BotCommands(self.notifier, self.scraper, self.settings, self.bot_config)
         
@@ -1592,12 +1521,15 @@ class ProfitBot:
         app.add_handler(CommandHandler("top", commands.top))
         app.add_error_handler(telegram_error_handler)
 
-        logger.info("✅ Bot ready")
+        logger.info("✅ Handlers registered")
         
+        await asyncio.sleep(0.5)
         asyncio.create_task(self._scan_loop())
+        logger.info("✅ Scan loop task started")
+        logger.info("🔧 POST_INIT COMPLETE")
 
     async def _post_shutdown(self, app):
-        logger.info("Shutdown...")
+        logger.info("🔧 Shutdown...")
         await self.seen_manager.cleanup_and_save()
 
     def run(self):
@@ -1616,11 +1548,11 @@ class ProfitBot:
                 .build()
             )
 
-            logger.info("🚀 Polling started...")
+            logger.info("🚀 Polling gestart...")
             app.run_polling(allowed_updates=None, drop_pending_updates=True)
 
         except Exception as e:
-            logger.exception(f"FATAL: {e}")
+            logger.exception(f"❌ FATAL: {e}")
             sys.exit(1)
 
 # ---------------------------------------------------------
@@ -1635,7 +1567,7 @@ def main():
         logger.info("Loading filters...")
         filter_config = FilterConfig.from_file(Path("filters.json"))
         
-        logger.info(f"✅ Ready: {len(filter_config.models)} modellen")
+        logger.info(f"✅ Ready: {len(filter_config.models)} models")
 
         atexit.register(
             notify_shutdown_sync,
@@ -1647,7 +1579,7 @@ def main():
         bot.run()
 
     except Exception as e:
-        logger.exception(f"STARTUP ERROR: {e}")
+        logger.exception(f"❌ ERROR: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
