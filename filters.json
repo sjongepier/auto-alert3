@@ -1,0 +1,77 @@
+{
+  "models": [
+    "aygo",
+    "yaris",
+    "c1",
+    "107",
+    "picanto",
+    "i10",
+    "up",
+    "mii",
+    "citigo",
+    "fiesta",
+    "panda",
+    "500"
+  ],
+  "motivation_words": [
+    "snel",
+    "moet weg",
+    "emigr",
+    "inruil",
+    "spoedverkoop",
+    "direct",
+    "haast",
+    "verhuiz",
+    "noodverkoop",
+    "weg ermee",
+    "te koop",
+    "graag weg"
+  ],
+  "dealer_words": [
+    "autohandel",
+    "autobedrijf",
+    "concessionaris",
+    "dealer",
+    "occasion centrum",
+    "auto import",
+    "bedrijfsauto",
+    "lease"
+  ],
+  "red_flags": [
+    "crashed",
+    "gestolen",
+    "defect motor",
+    "rijdt niet",
+    "motor kapot",
+    "sloperij",
+    "bouwproject",
+    "onderdelen",
+    "reparatie nodig"
+  ],
+  "quality_indicators": [
+    "onderhouden",
+    "nap",
+    "apk",
+    "airco",
+    "carplay",
+    "cruise",
+    "camera",
+    "navigatie",
+    "bluetooth",
+    "elektrisch"
+  ],
+  "model_aliases": {
+    "aygo": ["aygo", "toyota aygo", "aygo x"],
+    "yaris": ["yaris", "toyota yaris", "yaris hybrid"],
+    "c1": ["c1", "citroen c1"],
+    "107": ["107", "peugeot 107"],
+    "picanto": ["picanto", "kia picanto"],
+    "i10": ["i10", "hyundai i10"],
+    "up": ["up", "volkswagen up", "vw up"],
+    "mii": ["mii", "seat mii"],
+    "citigo": ["citigo", "skoda citigo"],
+    "fiesta": ["fiesta", "ford fiesta"],
+    "panda": ["panda", "fiat panda"],
+    "500": ["500", "fiat 500"]
+  }
+}
