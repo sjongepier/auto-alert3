@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional, Dict, List, Set, Tuple
 from datetime import datetime, timedelta
 from enum import Enum
-from telegram.ext import ApplicationBuilder
+from telegram.ext import ApplicationBuilder, CommandHandler
 import sys
 
 # ---------------------------------------------------------
@@ -108,8 +108,6 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger("profit-bot")
     logger.setLevel(level)
 
-    # Expliciet naar stdout, anders kleurt je hosting-platform INFO-logs
-    # per ongeluk rood (StreamHandler gaat standaard naar stderr).
     console_handler = logging.StreamHandler(stream=sys.stdout)
     console_handler.setFormatter(
         ColoredFormatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -127,17 +125,12 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
 logger = setup_logging()
 
 # ---------------------------------------------------------
-# SHUTDOWN NOTIFICATIE (werkt altijd, ook bij crash/herstart)
+# SHUTDOWN NOTIFICATIE
 # ---------------------------------------------------------
 
 _shutdown_notified = False
 
 def notify_shutdown_sync(token: str, chat_id: str, reason: str = "Bot is gestopt"):
-    """
-    Synchrone, dependency-lichte melding via de Telegram HTTP API.
-    Gebruikt geen asyncio/aiohttp zodat dit ook werkt tijdens
-    process-afsluiting of vanuit een except-block bij een crash.
-    """
     global _shutdown_notified
     if _shutdown_notified:
         return
@@ -159,15 +152,10 @@ def notify_shutdown_sync(token: str, chat_id: str, reason: str = "Bot is gestopt
 
 
 # ---------------------------------------------------------
-# RDW KENTEKEN CHECK (gratis, publieke overheids-API)
+# RDW KENTEKEN CHECK
 # ---------------------------------------------------------
 
 def extract_kenteken(text: str) -> Optional[str]:
-    """
-    Probeert een Nederlands kenteken uit tekst te halen.
-    Werkt alleen als de verkoper het kenteken zelf in de
-    titel/beschrijving heeft gezet (niet altijd het geval).
-    """
     match = KENTEKEN_PATTERN.search(text)
     if not match:
         return None
@@ -181,12 +169,6 @@ def extract_kenteken(text: str) -> Optional[str]:
 
 
 class RDWClient:
-    """
-    Client voor de gratis, publieke RDW open data API.
-    Geen bot-detectie, geen rate-limit problemen zoals bij AutoScout24 —
-    dit is officiële overheidsdata voor voertuiginformatie (geen prijzen).
-    """
-
     BASE_URL = "https://opendata.rdw.nl/resource/m9d7-ebf2.json"
 
     def __init__(self):
@@ -226,11 +208,10 @@ class RDWClient:
 
 
 # ---------------------------------------------------------
-# MARKET VALUE CALCULATOR (fail-cache + circuit breaker)
+# MARKET VALUE CALCULATOR
 # ---------------------------------------------------------
 
 class MarketValueCalculator:
-    """Bereken marktwaarde op basis van vergelijkbare auto's."""
 
     def __init__(self):
         self._cache: Dict[str, Tuple[Optional[float], datetime]] = {}
@@ -452,7 +433,6 @@ class Listing:
                 self.model = words[1]
 
     async def _try_rdw_check(self, rdw_client: RDWClient, client: 'SmartClient') -> None:
-        """Best-effort kenteken check. Faalt stil als er geen kenteken in de tekst staat."""
         kenteken = extract_kenteken(f"{self.title} {self.description}")
         if not kenteken:
             return
@@ -503,7 +483,6 @@ class Listing:
             self.deal_quality = DealQuality.POOR
             return
 
-        # Bonus: probeer kenteken te verifiëren via RDW (gratis, betrouwbaar)
         await self._try_rdw_check(rdw_client, client)
 
         if not self.year or not self.km or not self.brand or not self.model:
@@ -666,12 +645,10 @@ class SeenLinksManager:
             self._save()
 
 # ---------------------------------------------------------
-# HTTP CLIENT (lock-based rate limiter)
+# HTTP CLIENT
 # ---------------------------------------------------------
 
 class SmartClient:
-    """Smart HTTP client met anti-detection."""
-
     USER_AGENTS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -1080,6 +1057,62 @@ class TelegramNotifier:
         return await self.send_message(message)
 
 # ---------------------------------------------------------
+# BOT COMMANDS (nu correct gedefinieerd VOOR ProfitBot)
+# ---------------------------------------------------------
+
+class BotCommands:
+    """Handler voor bot commands."""
+
+    def __init__(self, notifier: TelegramNotifier, scraper: ProfitScraper):
+        self.notifier = notifier
+        self.scraper = scraper
+
+    async def start(self, update, context):
+        welcome = (
+            "🚀 *Welkom bij Auto Profit Bot!*\n\n"
+            "Ik scan 24/7 Marktplaats voor winstgevende auto deals.\n\n"
+            "✅ Alleen deals met €500+ winst\n"
+            "✅ Realtime marktwaarde analyse\n"
+            "✅ Automatische dealer filtering\n\n"
+            "Je ontvangt nu automatisch alerts bij goede deals!\n\n"
+            "Gebruik /help voor meer info."
+        )
+        await update.message.reply_text(welcome, parse_mode='Markdown')
+
+    async def help(self, update, context):
+        help_text = (
+            "❓ *Hoe werkt de bot?*\n\n"
+            "1️⃣ Ik scan elke 8 seconden Marktplaats\n"
+            "2️⃣ Bij nieuwe auto's check ik de marktwaarde\n"
+            "3️⃣ Als winst >€500: je krijgt een alert!\n\n"
+            "📊 *Deal Categorieën:*\n"
+            "💎 GODLIKE: €1000+ winst\n"
+            "🔥 EXCELLENT: €500-1000 winst\n"
+            "✅ GOOD: €300-500 winst\n\n"
+            "💡 *Tips:*\n"
+            "• Reageer binnen 5 minuten\n"
+            "• Screenshot + direct bellen\n"
+            "• Onderhandel altijd\n\n"
+            "Commands:\n"
+            "/stats - Bekijk statistieken\n"
+            "/help - Deze uitleg"
+        )
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+
+    async def stats(self, update, context):
+        stats = self.scraper.get_stats()
+
+        stats_text = (
+            "📊 *Bot Statistieken*\n\n"
+            f"🔍 Scans: {stats['scans']}\n"
+            f"📋 Listings bekeken: {stats['listings_checked']}\n"
+            f"💰 Deals gevonden: {stats['deals_found']}\n\n"
+            f"⚡ Scan interval: 8 seconden\n"
+            f"🎯 Min. winst: €500\n"
+        )
+        await update.message.reply_text(stats_text, parse_mode='Markdown')
+
+# ---------------------------------------------------------
 # MAIN BOT
 # ---------------------------------------------------------
 
@@ -1145,6 +1178,12 @@ class ProfitBot:
             self.seen_manager,
         )
 
+        # Command handlers correct geregistreerd VOORDAT polling start
+        commands = BotCommands(self.notifier, self.scraper)
+        app.add_handler(CommandHandler("start", commands.start))
+        app.add_handler(CommandHandler("help", commands.help))
+        app.add_handler(CommandHandler("stats", commands.stats))
+
         asyncio.create_task(self._scan_loop())
 
     async def _post_shutdown(self, app):
@@ -1163,7 +1202,7 @@ class ProfitBot:
                 .build()
             )
 
-            app.run_polling(allowed_updates=[], drop_pending_updates=True)
+            app.run_polling(allowed_updates=None, drop_pending_updates=True)
 
         except Exception:
             logger.exception("Fatal error")
@@ -1178,10 +1217,6 @@ def main():
         bot_config = BotConfig.from_env()
         filter_config = FilterConfig.from_file(Path("filters.json"))
 
-        # Zorgt dat je ALTIJD een Telegram-melding krijgt zodra het
-        # proces stopt (normale stop, crash, herstart door platform).
-        # Werkt niet bij een harde kill -9 / OOM-kill, want dat kan
-        # geen enkel Python-proces zelf nog opvangen.
         atexit.register(
             notify_shutdown_sync,
             bot_config.telegram_token,
@@ -1196,78 +1231,4 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main()# In de imports, voeg toe:
-from telegram.ext import CommandHandler
-
-# Na class TelegramNotifier, voeg toe:
-class BotCommands:
-    """Handler voor bot commands."""
-    
-    def __init__(self, notifier: TelegramNotifier, scraper: ProfitScraper):
-        self.notifier = notifier
-        self.scraper = scraper
-    
-    async def start(self, update, context):
-        """Start command."""
-        welcome = (
-            "🚀 *Welkom bij Auto Profit Bot!*\n\n"
-            "Ik scan 24/7 Marktplaats voor winstgevende auto deals.\n\n"
-            "✅ Alleen deals met €500+ winst\n"
-            "✅ Realtime marktwaarde analyse\n"
-            "✅ Automatische dealer filtering\n\n"
-            "Je ontvangt nu automatisch alerts bij goede deals!\n\n"
-            "Gebruik /help voor meer info."
-        )
-        await update.message.reply_text(welcome, parse_mode='Markdown')
-    
-    async def help(self, update, context):
-        """Help command."""
-        help_text = (
-            "❓ *Hoe werkt de bot?*\n\n"
-            "1️⃣ Ik scan elke 8 seconden Marktplaats\n"
-            "2️⃣ Bij nieuwe auto's check ik de marktwaarde\n"
-            "3️⃣ Als winst >€500: je krijgt een alert!\n\n"
-            "📊 *Deal Categorieën:*\n"
-            "💎 GODLIKE: €1000+ winst\n"
-            "🔥 EXCELLENT: €500-1000 winst\n"
-            "✅ GOOD: €300-500 winst\n\n"
-            "💡 *Tips:*\n"
-            "• Reageer binnen 5 minuten\n"
-            "• Screenshot + direct bellen\n"
-            "• Onderhandel altijd\n\n"
-            "Commands:\n"
-            "/stats - Bekijk statistieken\n"
-            "/help - Deze uitleg"
-        )
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-    
-    async def stats(self, update, context):
-        """Stats command."""
-        stats = self.scraper.get_stats()
-        
-        stats_text = (
-            "📊 *Bot Statistieken*\n\n"
-            f"🔍 Scans: {stats['scans']}\n"
-            f"📋 Listings bekeken: {stats['listings_checked']}\n"
-            f"💰 Deals gevonden: {stats['deals_found']}\n\n"
-            f"⚡ Scan interval: 8 seconden\n"
-            f"🎯 Min. winst: €500\n"
-        )
-        await update.message.reply_text(stats_text, parse_mode='Markdown')
-
-# In ProfitBot class, update _post_init:
-async def _post_init(self, app):
-    self.notifier = TelegramNotifier(app, self.bot_config.telegram_chat_id)
-    self.scraper = ProfitScraper(
-        self.bot_config,
-        self.filter_config,
-        self.seen_manager,
-    )
-    
-    # Voeg command handlers toe
-    commands = BotCommands(self.notifier, self.scraper)
-    app.add_handler(CommandHandler("start", commands.start))
-    app.add_handler(CommandHandler("help", commands.help))
-    app.add_handler(CommandHandler("stats", commands.stats))
-    
-    asyncio.create_task(self._scan_loop())
+    main()
