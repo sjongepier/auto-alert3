@@ -27,60 +27,67 @@ class BotConfig:
     token: str = os.getenv("TELEGRAM_TOKEN", "")
     chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
     check_interval: int = int(os.getenv("CHECK_INTERVAL", "300"))
-    seen_file: Path = Path("seen_links.json")
     filter_file: Path = Path("filters.json")
 
 class ProfitScraper:
     def __init__(self, config: BotConfig):
         self.config = config
-        self.seen_links = set()
-        self.filters = self._load_filters()
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "nl-NL,nl;q=0.9"
         }
 
-    def _load_filters(self) -> Dict:
-        if self.config.filter_file.exists():
-            return json.loads(self.config.filter_file.read_text())
-        return {"models": ["aygo"]}
-
     async def fetch_links(self, model: str) -> List[str]:
-        # We proberen de 'Lijst' weergave, die is makkelijker te lezen voor bots
         url = f"https://www.marktplaats.nl/q/{quote(model)}/"
         links = []
         try:
             async with aiohttp.ClientSession(headers=self.headers) as session:
                 async with session.get(url, timeout=15) as resp:
                     html = await resp.text()
-                    # Zoek naar alle advertentie-links
+                    # We zoeken naar advertentie links
                     found = re.findall(r'href="((?:/v/|/a/)[^"]+m\d{8,}[^"]*)"', html)
                     for l in found:
                         full = f"https://www.marktplaats.nl{l}"
                         if full not in links: links.append(full)
-        except Exception as e:
-            logger.error(f"Fetch error: {e}")
+        except: pass
         return links
 
     async def get_details(self, url: str) -> Optional[Dict]:
-        # We negeren even de 'seen_links' voor de test, zodat we ALTIJD resultaat zien
         try:
             async with aiohttp.ClientSession(headers=self.headers) as session:
                 async with session.get(url, timeout=10) as resp:
+                    if resp.status != 200: return None
                     html = await resp.text()
-                    json_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
-                    if not json_match: return None
-                    data = json.loads(unescape(json_match.group(1)))
-                    ad = data['props']['pageProps']['ad']
                     
+                    # We gebruiken Meta Tags (die Marktplaats voor Google/Facebook gebruikt)
+                    # Deze zijn veel stabieler dan de interne JSON
+                    title_match = re.search(r'property="og:title" content="(.*?)"', html)
+                    price_match = re.search(r'property="product:price:amount" content="(.*?)"', html)
+                    
+                    if not title_match: # Fallback voor titel
+                        title_match = re.search(r'<title>(.*?)</title>', html)
+
+                    title = unescape(title_match.group(1)) if title_match else "Auto"
+                    
+                    # Prijs extractor
+                    price = 0
+                    if price_match:
+                        price = int(float(price_match.group(1)))
+                    else:
+                        # Zoek naar prijs in de tekst als de meta tag mist
+                        p_match = re.search(r'€\s?([0-9.,]+)', html)
+                        if p_match:
+                            price = int(p_match.group(1).replace('.', '').replace(',', ''))
+
                     return {
                         "url": url,
-                        "title": ad.get('title', 'Geen titel'),
-                        "price": int(ad.get('priceInfo', {}).get('priceCents', 0) // 100),
-                        "km": 0, "year": 0 # Voor test even simpel
+                        "title": title[:60],
+                        "price": price
                     }
-        except: return None
+        except Exception as e:
+            logger.error(f"Fout bij {url}: {e}")
+            return None
 
 class ProfitBot:
     def __init__(self):
@@ -92,42 +99,47 @@ class ProfitBot:
         if self.is_scanning: return
         self.is_scanning = True
         
-        models = self.scraper.filters.get('models', ["aygo"])
-        total_checked = 0
-        total_sent = 0
+        # Modellen uit filters laden
+        models = ["aygo"]
+        if self.config.filter_file.exists():
+            models = json.loads(self.config.filter_file.read_text()).get("models", models)
 
-        if manual: await context.bot.send_message(self.config.chat_id, f"🔍 Test-scan gestart voor: {', '.join(models)}")
+        if manual: await context.bot.send_message(self.config.chat_id, "🔍 Scan gestart...")
+
+        total_links = 0
+        sent_count = 0
 
         for model in models:
             links = await self.scraper.fetch_links(model)
-            total_checked += len(links)
+            total_links += len(links)
             
-            for url in links[:3]: # Check er maar 3 per model voor de test
+            # Check de eerste 3 van elk model
+            for url in links[:3]:
                 details = await self.scraper.get_details(url)
-                if details:
-                    total_sent += 1
-                    msg = (f"🧪 *TEST RESULTAAT*\n\n🚘 {details['title']}\n💰 €{details['price']}\n🔗 [Link]({details['url']})")
+                if details and details['price'] > 100:
+                    sent_count += 1
+                    msg = (f"🚗 *AUTO GEVONDEN*\n\n"
+                           f"📦 {details['title']}\n"
+                           f"💰 Prijs: €{details['price']:,}\n\n"
+                           f"🔗 [Bekijk op Marktplaats]({details['url']})")
                     await context.bot.send_message(self.config.chat_id, msg, parse_mode=constants.ParseMode.MARKDOWN)
-                    await asyncio.sleep(1)
-            
+                    await asyncio.sleep(1.5)
+            await asyncio.sleep(2)
+
         if manual:
             await context.bot.send_message(
                 self.config.chat_id, 
-                f"📊 *Scan Rapport:*\n- Links gevonden op Marktplaats: {total_checked}\n- Berichten gestuurd: {total_sent}\n\nAls 'Links gevonden' 0 is, blokkeert Marktplaats ons IP."
+                f"✅ Scan voltooid!\n- Links gevonden: {total_links}\n- Berichten gestuurd: {sent_count}"
             )
-        
         self.is_scanning = False
 
     async def scan_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self.perform_scan(context, manual=True)
 
-    async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Bot is online. Gebruik /scan voor de test.")
-
     def run(self):
         app = ApplicationBuilder().token(self.config.token).build()
-        app.add_handler(CommandHandler("start", self.start_cmd))
         app.add_handler(CommandHandler("scan", self.scan_cmd))
+        app.job_queue.run_repeating(lambda ctx: self.perform_scan(ctx), interval=self.config.check_interval, first=5)
         app.run_polling()
 
 if __name__ == "__main__":
