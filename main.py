@@ -1022,8 +1022,35 @@ class MarktplaatsRSSMonitor:
     def __init__(self, filter_config: FilterConfig):
         self.filter_config = filter_config
         self._seen_items: Set[str] = set()
+        self._use_fallback = False
 
-    async def check_rss(self, model: str, client: SmartClient) -> List[str]:
+    async def test_api(self, client: 'SmartClient') -> bool:
+        """Test API response"""
+        test_url = "https://www.marktplaats.nl/lrp/api/search?query=aygo&limit=10"
+        
+        logger.info("🧪 Testing Marktplaats API...")
+        data = await client.get_html(test_url)
+        
+        if not data:
+            logger.error("❌ API returned nothing - will use HTML fallback")
+            self._use_fallback = True
+            return False
+        
+        logger.info(f"✅ API response: {len(data)} bytes")
+        
+        try:
+            json_data = json.loads(data)
+            listings = json_data.get('listings', [])
+            logger.info(f"✅ API working: {len(listings)} listings found")
+            return True
+        except Exception as e:
+            logger.error(f"❌ API parse failed: {e} - will use HTML fallback")
+            logger.debug(f"Response preview: {data[:300]}")
+            self._use_fallback = True
+            return False
+
+    async def check_rss(self, model: str, client: 'SmartClient') -> List[str]:
+        """Check via API (met debug logging)"""
         rss_url = (
             f"https://www.marktplaats.nl/lrp/api/search?"
             f"query={model}&searchInTitleAndDescription=true&limit=150"
@@ -1032,6 +1059,7 @@ class MarktplaatsRSSMonitor:
         data = await client.get_html(rss_url)
         
         if not data:
+            logger.warning(f"⚠️ {model}: NO DATA from API")
             return []
 
         new_listings = []
@@ -1039,7 +1067,12 @@ class MarktplaatsRSSMonitor:
         try:
             json_data = json.loads(data)
             listings = json_data.get('listings', [])
-            logger.info(f"📡 {model}: {len(listings)} listings")
+            
+            if len(listings) == 0:
+                logger.warning(f"⚠️ {model}: API returned 0 listings")
+                logger.debug(f"Response preview: {data[:500]}")
+            else:
+                logger.info(f"📡 {model}: {len(listings)} listings from API")
 
             for listing in listings:
                 listing_id = listing.get('itemId')
@@ -1055,8 +1088,33 @@ class MarktplaatsRSSMonitor:
                 self._seen_items = set(list(self._seen_items)[-5000:])
 
         except Exception as e:
-            logger.error(f"❌ RSS parse error: {e}")
+            logger.error(f"❌ RSS parse error for {model}: {e}")
+            logger.debug(f"Raw response: {data[:200]}")
 
+        return new_listings
+
+    async def check_rss_fallback(self, model: str, client: 'SmartClient') -> List[str]:
+        """Fallback: scrape HTML search page"""
+        
+        search_url = f"https://www.marktplaats.nl/q/{model}/"
+        html = await client.get_html(search_url)
+        
+        if not html:
+            logger.warning(f"⚠️ {model}: Geen HTML ontvangen")
+            return []
+        
+        # Extract listing URLs from HTML
+        pattern = r'href="(/a/[^"]+/m\d+)"'
+        matches = re.findall(pattern, html)
+        
+        new_listings = []
+        for path in matches[:25]:  # Limit to first 25
+            url = f"https://www.marktplaats.nl{path}"
+            if url not in self._seen_items:
+                self._seen_items.add(url)
+                new_listings.append(url)
+        
+        logger.info(f"🔎 {model}: {len(new_listings)} nieuwe listings (HTML fallback)")
         return new_listings
 
 class ProfitScraper:
@@ -1172,22 +1230,33 @@ class ProfitScraper:
         profit = listing.market_analysis.profit_potential if listing.market_analysis else 0
 
         logger.info(
-            f"🎉 DEAL: {listing.deal_quality.value} | €{profit} | {listing.title[:40]}"
+            f"🎉 DEAL GEVONDEN: {listing.deal_quality.value} | €{profit} | {listing.title[:40]}"
         )
 
         return listing
 
     async def scan_model(self, model: str, client: SmartClient) -> List[Listing]:
-
+        # Probeer eerst API
         new_links = await self.rss_monitor.check_rss(model, client)
+        
+        # Als API faalt OF _use_fallback is True, probeer HTML scraping
+        if not new_links or self.rss_monitor._use_fallback:
+            fallback_links = await self.rss_monitor.check_rss_fallback(model, client)
+            new_links.extend(fallback_links)
 
         if not new_links:
             return []
+
+        logger.info(f"🔍 {model}: Processing {len(new_links)} nieuwe links...")
 
         tasks = [self.process_listing(link, model, client) for link in new_links]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         deals = [r for r in results if isinstance(r, Listing) and r is not None]
+        
+        if deals:
+            logger.info(f"✅ {model}: {len(deals)} DEALS FOUND!")
+        
         return deals
 
     async def scan_all(self, client: SmartClient) -> List[Listing]:
@@ -1204,7 +1273,7 @@ class ProfitScraper:
             aliases = self.filter_config.model_aliases.get(model, [])
             all_search_terms.extend(aliases)
 
-        logger.info(f"🔎 {len(all_search_terms)} terms")
+        logger.info(f"🔎 Scanning {len(all_search_terms)} search terms...")
 
         tasks = [self.scan_model(term, client) for term in all_search_terms]
         results = await asyncio.gather(*tasks)
@@ -1217,11 +1286,12 @@ class ProfitScraper:
         logger.info(f"  Total deals in memory: {len(self.found_deals)}")
         
         if len(all_deals) > 0:
-            logger.info(f"✅ DEALS TO SEND:")
+            logger.info(f"✅ {len(all_deals)} DEALS TO SEND TO TELEGRAM:")
             for deal in all_deals:
-                logger.info(f"  - {deal.deal_quality.value}: {deal.title[:40]} (€{deal.price})")
+                profit = deal.market_analysis.profit_potential if deal.market_analysis else 0
+                logger.info(f"  💰 {deal.deal_quality.value}: €{profit} - {deal.title[:40]}")
         else:
-            logger.info(f"❌ NO DEALS FOUND")
+            logger.info(f"❌ NO DEALS FOUND THIS SCAN")
         
         logger.info(f"{'='*60}\n")
 
@@ -1250,14 +1320,14 @@ class TelegramNotifier:
 
     async def send_message(self, message: str) -> bool:
         try:
-            logger.info(f"📤 Telegram send ({len(message)} chars)...")
+            logger.info(f"📤 Sending to Telegram ({len(message)} chars)...")
             result = await self.app.bot.send_message(
                 chat_id=self.chat_id,
                 text=message,
                 disable_web_page_preview=True,
             )
             self._stats["sent"] += 1
-            logger.info(f"✅ Sent (ID: {result.message_id})")
+            logger.info(f"✅ Telegram message sent (ID: {result.message_id})")
             return True
         except Exception as e:
             logger.error(f"❌ Telegram error: {e}")
@@ -1347,7 +1417,7 @@ class BotCommands:
         await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 async def telegram_error_handler(update, context):
-    logger.error(f"❌ Error: {context.error}")
+    logger.error(f"❌ Telegram Error: {context.error}")
 
 class ProfitBot:
 
@@ -1366,7 +1436,7 @@ class ProfitBot:
 
     def _setup_signals(self):
         def handle(signum, frame):
-            logger.info(f"🛑 Shutdown")
+            logger.info(f"🛑 Shutdown signal received")
             self._shutdown.set()
 
         signal.signal(signal.SIGTERM, handle)
@@ -1382,37 +1452,47 @@ class ProfitBot:
                 break
             await asyncio.sleep(0.1)
         else:
-            logger.error("❌ Notifier FAILED")
+            logger.error("❌ Notifier initialization FAILED")
             return
 
         startup_ok = await self.notifier.send_startup(self.settings.min_profit_margin)
         if not startup_ok:
-            logger.error("❌ Startup FAILED")
+            logger.error("❌ Startup notification FAILED")
             return
 
-        logger.info("✅ Startup OK")
+        logger.info("✅ Startup notification sent")
 
         async with SmartClient(self.bot_config) as client:
+            # TEST API EERST
+            api_works = await self.scraper.rss_monitor.test_api(client)
+            if not api_works:
+                logger.warning("⚠️ API test failed - will use HTML fallback for all searches")
+            
             while not self._shutdown.is_set():
 
                 if not self.settings.paused:
                     try:
                         deals = await self.scraper.scan_all(client)
                         
-                        logger.info(f"✅ {len(deals)} deals found")
+                        logger.info(f"✅ Scan complete: {len(deals)} deals found")
 
                         if deals:
-                            logger.info(f"📤 Sending {len(deals)} to Telegram...")
+                            logger.info(f"📤 Sending {len(deals)} deals to Telegram...")
                             for deal in deals:
                                 sent = await self.notifier.send_listing(deal)
                                 if sent:
-                                    logger.info(f"✅ Sent: {deal.title[:30]}")
+                                    logger.info(f"✅ Sent to Telegram: {deal.title[:30]}")
+                                else:
+                                    logger.error(f"❌ Failed to send: {deal.title[:30]}")
                                 await asyncio.sleep(1)
+                            logger.info(f"✅ All {len(deals)} deals sent to Telegram!")
+                        else:
+                            logger.info("ℹ️ No deals to send this scan")
 
                         await self.seen_manager.cleanup_and_save()
 
                     except Exception as e:
-                        logger.exception(f"❌ Error: {e}")
+                        logger.exception(f"❌ Error in scan loop: {e}")
                         await asyncio.sleep(5)
 
                 try:
@@ -1427,7 +1507,7 @@ class ProfitBot:
         logger.info("🛑 Scan loop ended")
 
     async def _post_init(self, app):
-        logger.info("🔧 Init...")
+        logger.info("🔧 Initializing bot components...")
         
         self.notifier = TelegramNotifier(app, self.bot_config.telegram_chat_id)
         logger.info("✅ Notifier created")
@@ -1451,14 +1531,14 @@ class ProfitBot:
         app.add_handler(CommandHandler("top", commands.top))
         app.add_error_handler(telegram_error_handler)
 
-        logger.info("✅ Handlers registered")
+        logger.info("✅ Command handlers registered")
         
         await asyncio.sleep(0.5)
         asyncio.create_task(self._scan_loop())
-        logger.info("✅ Scan loop started")
+        logger.info("✅ Scan loop task started")
 
     async def _post_shutdown(self, app):
-        logger.info("🔧 Shutdown...")
+        logger.info("🔧 Shutting down...")
         await self.seen_manager.cleanup_and_save()
 
     def run(self):
@@ -1476,11 +1556,11 @@ class ProfitBot:
                 .build()
             )
 
-            logger.info("🚀 Start polling...")
+            logger.info("🚀 Starting Telegram polling...")
             app.run_polling(allowed_updates=None, drop_pending_updates=True)
 
         except Exception as e:
-            logger.exception(f"❌ FATAL: {e}")
+            logger.exception(f"❌ FATAL ERROR: {e}")
             sys.exit(1)
 
 def main():
@@ -1503,7 +1583,7 @@ def main():
         bot.run()
 
     except Exception as e:
-        logger.exception(f"❌ ERROR: {e}")
+        logger.exception(f"❌ STARTUP ERROR: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
