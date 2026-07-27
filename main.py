@@ -525,12 +525,12 @@ class Listing:
         combined_text = f"{self.title} {self.description}".lower()
 
         dealer_matches = [word for word in filter_config.dealer_words if word in combined_text]
-        self.is_dealer = len(dealer_matches) >= 4
+        self.is_dealer = len(dealer_matches) >= 5
         
         self.motivated_seller = any(word in combined_text for word in filter_config.motivation_words)
         
         red_flag_matches = [flag for flag in filter_config.red_flags if flag in combined_text]
-        self.has_red_flags = len(red_flag_matches) > 0
+        self.has_red_flags = len(red_flag_matches) > 2
         
         self.is_urgent = self.detect_urgency()
 
@@ -540,31 +540,38 @@ class Listing:
         )
 
         if self.is_dealer or self.has_red_flags:
+            logger.info(f"   ❌ Blocked: dealer or red flags")
             self.deal_quality = DealQuality.POOR
             return
 
         await self._try_rdw_check(rdw_client, client)
 
-        # ✅ ACCEPT MORE DATA COMBINATIONS
-        has_year = self.year is not None
-        has_km = self.km is not None
-        has_brand = self.brand is not None
-        has_model = self.model is not None
-
-        # ✅ ONLY SKIP IF WE HAVE ABSOLUTELY NOTHING
-        if not (has_year or has_km or has_brand or has_model):
-            self.deal_quality = DealQuality.POOR
+        # ✅ STAP 1: PRIJS CHECK - EERST PRIORITEIT
+        if self.price < 1200:
+            logger.info(f"   ✅ VERY CHEAP (€{self.price}) → WATCHLIST")
+            self.deal_quality = DealQuality.WATCHLIST
+            self.market_analysis = MarketAnalysis(
+                asking_price=self.price,
+                market_value=self.price * 1.5,
+                profit_potential=int(self.price * 0.4),
+                profit_percentage=40,
+                is_profitable=True,
+                is_estimated=True,
+            )
             return
 
-        # ✅ IF WE HAVE YEAR AND KM, ANALYZE FULLY
-        if has_year and has_km and has_brand and has_model:
+        # ✅ STAP 2: ALS WE JAAR + KM HEBBEN → FULL ANALYSE
+        if self.year and self.km and self.brand and self.model:
+            logger.info(f"   📊 Full data: {self.brand} {self.model} {self.year} {self.km}km")
             
             if self.km > settings.max_km:
+                logger.info(f"   ❌ KM too high: {self.km} > {settings.max_km}")
                 self.deal_quality = DealQuality.POOR
                 return
 
             price_per_km = self.price / self.km
             if price_per_km > settings.price_per_km_limit:
+                logger.info(f"   ❌ €/km too high: €{price_per_km:.2f}")
                 self.deal_quality = DealQuality.POOR
                 return
 
@@ -575,13 +582,24 @@ class Listing:
             )
 
             if not market_value:
-                logger.info(f"   ❌ No market value")
-                self.deal_quality = DealQuality.POOR
+                logger.info(f"   ⚠️ No market value - fallback to cheap logic")
+                if self.price < 2500:
+                    self.deal_quality = DealQuality.WATCHLIST
+                    self.market_analysis = MarketAnalysis(
+                        asking_price=self.price,
+                        market_value=self.price * 1.3,
+                        profit_potential=int(self.price * 0.25),
+                        profit_percentage=25,
+                        is_profitable=True,
+                        is_estimated=True,
+                    )
+                else:
+                    self.deal_quality = DealQuality.POOR
                 return
 
             adjusted_min_profit = settings.min_profit_margin
             if self.is_urgent:
-                adjusted_min_profit = int(settings.min_profit_margin * 0.5)
+                adjusted_min_profit = int(settings.min_profit_margin * 0.3)
 
             self.market_analysis = MarketAnalysis.analyze(
                 self.price, market_value, adjusted_min_profit, is_estimated,
@@ -589,13 +607,16 @@ class Listing:
 
             if not self.market_analysis.is_profitable:
                 profit = self.market_analysis.profit_potential or 0
-                if profit > 50:
+                if profit > 0:
+                    logger.info(f"   👀 WATCHLIST: €{profit} (below target but positive)")
                     self.deal_quality = DealQuality.WATCHLIST
                     return
+                logger.info(f"   ❌ No profit: €{profit}")
                 self.deal_quality = DealQuality.POOR
                 return
 
             profit = self.market_analysis.profit_potential or 0
+            logger.info(f"   ✅ PROFIT: €{profit}")
 
             if profit >= 1500:
                 self.deal_quality = DealQuality.GODLIKE
@@ -607,23 +628,71 @@ class Listing:
                 self.deal_quality = DealQuality.AVERAGE
             else:
                 self.deal_quality = DealQuality.WATCHLIST
-        
-        else:
-            # ✅ PARTIAL DATA - TREAT AS WATCHLIST IF PRICE IS REASONABLE
-            if self.price < 2000:
-                logger.info(f"   ✅ Cheap auto (€{self.price}) - adding to WATCHLIST")
-                self.deal_quality = DealQuality.WATCHLIST
-                self.market_analysis = MarketAnalysis(
-                    asking_price=self.price,
-                    market_value=self.price * 1.3,
-                    profit_potential=int(self.price * 0.3),
-                    profit_percentage=30,
-                    is_profitable=True,
-                    is_estimated=True,
-                )
-                return
             
-            self.deal_quality = DealQuality.POOR
+            return
+        
+        # ✅ STAP 3: PARTIAL DATA - VEEL MEER TOLERANT
+        logger.info(f"   ⚠️ Partial data (jaar={self.year}, km={self.km}, brand={self.brand}, model={self.model})")
+        
+        # Lage prijs = ALTIJD interessant
+        if self.price < 1500:
+            logger.info(f"   ✅ Low price (€{self.price}) → WATCHLIST")
+            self.deal_quality = DealQuality.WATCHLIST
+            self.market_analysis = MarketAnalysis(
+                asking_price=self.price,
+                market_value=self.price * 1.4,
+                profit_potential=int(self.price * 0.3),
+                profit_percentage=30,
+                is_profitable=True,
+                is_estimated=True,
+            )
+            return
+        
+        # EVEN MET KM → CHECK €/KM
+        if self.km and self.price / self.km < 0.15:
+            logger.info(f"   ✅ Cheap per km (€{self.price/self.km:.2f}) → WATCHLIST")
+            self.deal_quality = DealQuality.WATCHLIST
+            self.market_analysis = MarketAnalysis(
+                asking_price=self.price,
+                market_value=self.price * 1.3,
+                profit_potential=int(self.price * 0.2),
+                profit_percentage=20,
+                is_profitable=True,
+                is_estimated=True,
+            )
+            return
+        
+        # GEMOTIVEERD + LAAG PRIJS
+        if self.motivated_seller and self.price < 3500:
+            logger.info(f"   ✅ Motivated seller + low price (€{self.price}) → WATCHLIST")
+            self.deal_quality = DealQuality.WATCHLIST
+            self.market_analysis = MarketAnalysis(
+                asking_price=self.price,
+                market_value=self.price * 1.35,
+                profit_potential=int(self.price * 0.25),
+                profit_percentage=25,
+                is_profitable=True,
+                is_estimated=True,
+            )
+            return
+        
+        # ALLEEN JAAR
+        if self.year and self.price < 2000:
+            logger.info(f"   ✅ Year + low price (€{self.price}) → WATCHLIST")
+            self.deal_quality = DealQuality.WATCHLIST
+            self.market_analysis = MarketAnalysis(
+                asking_price=self.price,
+                market_value=self.price * 1.3,
+                profit_potential=int(self.price * 0.25),
+                profit_percentage=25,
+                is_profitable=True,
+                is_estimated=True,
+            )
+            return
+        
+        # ANDERS: GEEN DEAL
+        logger.info(f"   ❌ No conditions met")
+        self.deal_quality = DealQuality.POOR
 
     @property
     def is_good_deal(self) -> bool:
