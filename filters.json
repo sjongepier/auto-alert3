@@ -1,0 +1,11 @@
+{
+  "models": ["aygo", "yaris", "c1", "107", "picanto", "i10", "up", "mii", "citigo", "fiesta", "panda", "500", "polo", "corsa"],
+  "opportunity_keywords": [
+    "motorschade", "tik in motor", "loopt niet", "defect", "koppeling slipt", 
+    "versnellingsbak kapot", "distributie geknapt", "schade", "blikschade", 
+    "deuk", "krassen", "apk afgekeurd", "zonder apk", "moet weg", "spoed", "emigratie"
+  ],
+  "exclude_keywords": [
+    "waterschade", "verdonken", "wok", "diefstal", "export", "geen kenteken"
+  ]
+}
