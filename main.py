@@ -29,61 +29,63 @@ logger = logging.getLogger("ProfitBot")
 class BotConfig:
     token: str = os.getenv("TELEGRAM_TOKEN", "")
     chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
-    check_interval: int = 300 # 5 minuten is beter voor stabiliteit
+    check_interval: int = 300 
     seen_file: Path = Path("seen_links.json")
 
 # ============================================================
-# DE NIEUWE SCRAPER (ZEER ROBUUST)
+# DE ULTIEME SCRAPER
 # ============================================================
 class ProfitScraper:
     def __init__(self, config: BotConfig):
         self.config = config
         self.seen_links = set()
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "nl-NL,nl;q=0.9",
+            "Referer": "https://www.google.com/",
         }
 
-    async def fetch_links(self, model: str) -> List[str]:
-        # We zoeken specifiek in de categorie Auto's (c91)
-        url = f"https://www.marktplaats.nl/q/{quote(model)}/#Category:91"
-        logger.info(f"🔎 Scannen van Marktplaats voor: {model}")
+    async def fetch_links(self, model: str) -> Tuple[List[str], str]:
+        # Zoeken in categorie 91 (Auto's) met sortering op 'Nieuwste'
+        url = f"https://www.marktplaats.nl/l/auto-s/q/{quote(model)}/p/1/#Category:91|sortBy:OPTIMIZED|sortOrder:DECREASING"
         
         try:
             async with aiohttp.ClientSession(headers=self.headers) as session:
                 async with session.get(url, timeout=20) as resp:
                     if resp.status != 200:
-                        return []
+                        return [], f"Fout: Marktplaats gaf status {resp.status}"
+                    
                     html = await resp.text()
                     
-                    # Methode 1: Zoek in de JSON data (het meest betrouwbaar)
+                    # Zoek naar de JSON data die Marktplaats altijd meestuurt
                     json_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
-                    found_urls = []
                     
+                    found_urls = []
                     if json_match:
                         try:
                             data = json.loads(unescape(json_match.group(1)))
-                            # Duik diep in de JSON structuur van de zoekresultaten
-                            listings = data.get('props', {}).get('pageProps', {}).get('searchListingData', {}).get('listings', [])
+                            # We proberen op verschillende plekken in de JSON te kijken naar de advertenties
+                            page_props = data.get('props', {}).get('pageProps', {})
+                            listings = page_props.get('searchListingData', {}).get('listings', [])
+                            
                             for item in listings:
-                                if 'vipUrl' in item:
+                                # Pak alleen echte advertenties, geen 'gesponsorde'
+                                if item.get('isVip', True) and 'vipUrl' in item:
                                     found_urls.append(f"https://www.marktplaats.nl{item['vipUrl']}")
-                        except Exception as e:
-                            logger.error(f"JSON Parse error: {e}")
+                        except:
+                            pass
 
-                    # Methode 2 Fallback: Regex voor /v/ of /a/ links
+                    # Fallback Regex als JSON faalt
                     if not found_urls:
-                        regex_links = re.findall(r'href="((?:/v/|/a/)[^"]+m\d{8,}[^"]*)"', html)
-                        for l in regex_links:
-                            url = f"https://www.marktplaats.nl{l}"
-                            if url not in found_urls:
-                                found_urls.append(url)
+                        links = re.findall(r'href="((?:/v/|/a/)[^"]+m\d{8,}[^"]*)"', html)
+                        for l in links:
+                            full = f"https://www.marktplaats.nl{l}"
+                            if full not in found_urls: found_urls.append(full)
 
-                    return list(dict.fromkeys(found_urls)) # Verwijder dubbele
+                    return list(dict.fromkeys(found_urls)), "Succes"
         except Exception as e:
-            logger.error(f"Netwerkfout: {e}")
-            return []
+            return [], f"Fout: {str(e)}"
 
     async def get_details(self, url: str) -> Optional[Dict]:
         if url in self.seen_links: return None
@@ -100,7 +102,7 @@ class ProfitScraper:
                     ad = data['props']['pageProps']['ad']
                     
                     price = int(ad.get('priceInfo', {}).get('priceCents', 0) // 100)
-                    title = ad.get('title', 'Onbekende auto')
+                    title = ad.get('title', 'Auto')
                     
                     km, year = 0, 0
                     for attr in ad.get('attributes', []):
@@ -122,29 +124,31 @@ class ProfitBot:
         self.scraper = ProfitScraper(self.config)
         self.is_scanning = False 
 
-    async def run_scan(self, context: ContextTypes.DEFAULT_TYPE):
-        if self.is_scanning: return
-        self.is_scanning = True
+    async def perform_scan(self, context: ContextTypes.DEFAULT_TYPE, manual=False):
+        if self.is_scanning:
+            if manual: await context.bot.send_message(chat_id=self.config.chat_id, text="⚠️ Er is al een scan bezig...")
+            return
         
-        # Testbericht: zo weet je dat hij begint
-        # await context.bot.send_message(chat_id=self.config.chat_id, text="🔄 Scan gestart...")
-
-        models = ["Toyota Aygo", "Volkswagen Polo", "Peugeot 107", "Citroen C1"]
+        self.is_scanning = True
+        models = ["Aygo", "Polo", "107", "C1", "Picanto", "Fiat 500"]
+        
         p = Path("filters.json")
         if p.exists():
-            try:
-                models = json.loads(p.read_text()).get("models", models)
+            try: models = json.loads(p.read_text()).get("models", models)
             except: pass
 
-        found_anything = False
+        if manual: await context.bot.send_message(chat_id=self.config.chat_id, text=f"🔎 Handmatige scan gestart voor {len(models)} modellen...")
+
+        total_found = 0
         for model in models:
-            links = await self.scraper.fetch_links(model)
-            logger.info(f"Resultaat voor {model}: {len(links)} advertenties.")
-            
-            for url in links[:10]:
+            links, status_msg = await self.scraper.fetch_links(model)
+            if manual and not links:
+                logger.info(f"Niks gevonden voor {model}: {status_msg}")
+
+            for url in links[:8]:
                 details = await self.scraper.get_details(url)
                 if details:
-                    found_anything = True
+                    total_found += 1
                     msg = (f"🚗 *Nieuwe Auto Gevonden!*\n\n"
                            f"📦 *{details['title']}*\n"
                            f"💰 Prijs: €{details['price']:,}\n"
@@ -156,23 +160,26 @@ class ProfitBot:
                     await asyncio.sleep(1)
             await asyncio.sleep(2)
 
+        if manual:
+            await context.bot.send_message(chat_id=self.config.chat_id, text=f"✅ Scan klaar! Totaal {total_found} nieuwe auto's gestuurd.")
+        
         self.is_scanning = False
 
-    async def test_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("✅ Verbinding met Telegram is OK! Wacht op de volgende scan.")
+    async def scan_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.perform_scan(context, manual=True)
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("💰 ProfitBot Online! Gebruik /scan voor een directe check.")
 
     def run(self):
-        if not self.config.token or not self.config.chat_id:
-            logger.error("TOKEN of CHAT_ID ontbreekt in Railway!")
-            return
-
         app = ApplicationBuilder().token(self.config.token).build()
-        app.add_handler(CommandHandler("test", self.test_cmd))
+        app.add_handler(CommandHandler("start", self.start_command))
+        app.add_handler(CommandHandler("scan", self.scan_command))
         
-        # Scan elke X seconden (volgens config)
-        app.job_queue.run_repeating(self.run_scan, interval=self.config.check_interval, first=5)
+        # Automatische scan
+        app.job_queue.run_repeating(lambda ctx: self.perform_scan(ctx), interval=self.config.check_interval, first=10)
         
-        logger.info("🚀 Bot draait. Gebruik /test in Telegram om te checken.")
+        logger.info("🤖 Bot draait. Gebruik /scan in Telegram.")
         app.run_polling()
 
 if __name__ == "__main__":
