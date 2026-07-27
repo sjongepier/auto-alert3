@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from telegram.ext import ApplicationBuilder, CommandHandler
 import sys
 from collections import Counter
+from urllib.parse import quote, urlparse, urlencode
 
 class DealQuality(Enum):
     GODLIKE = "GODLIKE"
@@ -70,6 +71,12 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     return logger
 
 logger = setup_logging()
+
+def build_search_url(base_url: str, query: str, **params) -> str:
+    """Build properly encoded search URL"""
+    encoded_query = quote(query)
+    param_str = urlencode(params)
+    return f"{base_url}?query={encoded_query}&{param_str}"
 
 @dataclass(frozen=True)
 class BotConfig:
@@ -270,7 +277,14 @@ class MarketValueCalculator:
             if datetime.now() - timestamp < self._pool_ttl:
                 return pool
 
-        search_url = f"https://www.marktplaats.nl/lrp/api/search?query={search_term}&searchInTitleAndDescription=true&limit={self._samples}"
+        # ✅ URL ENCODED
+        search_url = build_search_url(
+            "https://www.marktplaats.nl/lrp/api/search",
+            search_term,
+            searchInTitleAndDescription="true",
+            limit=str(self._samples)
+        )
+        
         raw = await client.get_html(search_url)
 
         if not raw:
@@ -461,6 +475,8 @@ class Listing:
             'volkswagen': ['up', 'polo'],
             'seat': ['mii', 'ibiza'],
             'skoda': ['citigo', 'fabia'],
+            'ford': ['fiesta', 'ka'],
+            'fiat': ['500', 'panda'],
         }
 
         for brand, models in brands.items():
@@ -524,13 +540,15 @@ class Listing:
 
         combined_text = f"{self.title} {self.description}".lower()
 
+        # ✅ MINDER STRENG: 8 dealer words ipv 5
         dealer_matches = [word for word in filter_config.dealer_words if word in combined_text]
-        self.is_dealer = len(dealer_matches) >= 5
+        self.is_dealer = len(dealer_matches) >= 8
         
         self.motivated_seller = any(word in combined_text for word in filter_config.motivation_words)
         
+        # ✅ MINDER STRENG: 4 red flags ipv 2
         red_flag_matches = [flag for flag in filter_config.red_flags if flag in combined_text]
-        self.has_red_flags = len(red_flag_matches) > 2
+        self.has_red_flags = len(red_flag_matches) > 4
         
         self.is_urgent = self.detect_urgency()
 
@@ -540,15 +558,15 @@ class Listing:
         )
 
         if self.is_dealer or self.has_red_flags:
-            logger.info(f"   ❌ Blocked: dealer or red flags")
+            logger.info(f"   ❌ Blocked: dealer={self.is_dealer} red_flags={len(red_flag_matches)}")
             self.deal_quality = DealQuality.POOR
             return
 
         await self._try_rdw_check(rdw_client, client)
 
-        # ✅ STAP 1: PRIJS CHECK - EERST PRIORITEIT
-        if self.price < 1200:
-            logger.info(f"   ✅ VERY CHEAP (€{self.price}) → WATCHLIST")
+        # ✅ STAP 1: PRIJS CHECK - VERHOOGD NAAR 1500
+        if self.price < 1500:
+            logger.info(f"   ✅ CHEAP (€{self.price}) → WATCHLIST")
             self.deal_quality = DealQuality.WATCHLIST
             self.market_analysis = MarketAnalysis(
                 asking_price=self.price,
@@ -583,7 +601,7 @@ class Listing:
 
             if not market_value:
                 logger.info(f"   ⚠️ No market value - fallback to cheap logic")
-                if self.price < 2500:
+                if self.price < 3000:  # ✅ VERHOOGD VAN 2500 NAAR 3000
                     self.deal_quality = DealQuality.WATCHLIST
                     self.market_analysis = MarketAnalysis(
                         asking_price=self.price,
@@ -597,9 +615,10 @@ class Listing:
                     self.deal_quality = DealQuality.POOR
                 return
 
+            # ✅ VERLAAGDE MIN PROFIT VOOR URGENTE DEALS
             adjusted_min_profit = settings.min_profit_margin
             if self.is_urgent:
-                adjusted_min_profit = int(settings.min_profit_margin * 0.3)
+                adjusted_min_profit = int(settings.min_profit_margin * 0.2)  # Van 0.3 naar 0.2
 
             self.market_analysis = MarketAnalysis.analyze(
                 self.price, market_value, adjusted_min_profit, is_estimated,
@@ -607,8 +626,9 @@ class Listing:
 
             if not self.market_analysis.is_profitable:
                 profit = self.market_analysis.profit_potential or 0
-                if profit > 0:
-                    logger.info(f"   👀 WATCHLIST: €{profit} (below target but positive)")
+                # ✅ MEER TOLERANT: -50 mag ook
+                if profit > -50:  # NIEUWE REGEL
+                    logger.info(f"   👀 WATCHLIST: €{profit} (marginaal)")
                     self.deal_quality = DealQuality.WATCHLIST
                     return
                 logger.info(f"   ❌ No profit: €{profit}")
@@ -620,22 +640,22 @@ class Listing:
 
             if profit >= 1500:
                 self.deal_quality = DealQuality.GODLIKE
-            elif profit >= 800:
+            elif profit >= 700:  # ✅ VERLAAGD VAN 800
                 self.deal_quality = DealQuality.EXCELLENT
-            elif profit >= 400:
+            elif profit >= 300:  # ✅ VERLAAGD VAN 400
                 self.deal_quality = DealQuality.GOOD
-            elif profit >= 150:
+            elif profit >= 100:  # ✅ VERLAAGD VAN 150
                 self.deal_quality = DealQuality.AVERAGE
             else:
                 self.deal_quality = DealQuality.WATCHLIST
             
             return
         
-        # ✅ STAP 3: PARTIAL DATA - VEEL MEER TOLERANT
-        logger.info(f"   ⚠️ Partial data (jaar={self.year}, km={self.km}, brand={self.brand}, model={self.model})")
+        # ✅ STAP 3: PARTIAL DATA - NOG MEER TOLERANT
+        logger.info(f"   ⚠️ Partial data (jaar={self.year}, km={self.km})")
         
-        # Lage prijs = ALTIJD interessant
-        if self.price < 1500:
+        # ✅ VERHOOGD NAAR 2000
+        if self.price < 2000:
             logger.info(f"   ✅ Low price (€{self.price}) → WATCHLIST")
             self.deal_quality = DealQuality.WATCHLIST
             self.market_analysis = MarketAnalysis(
@@ -648,8 +668,8 @@ class Listing:
             )
             return
         
-        # EVEN MET KM → CHECK €/KM
-        if self.km and self.price / self.km < 0.15:
+        # ✅ VERHOOGD NAAR 0.20
+        if self.km and self.price / self.km < 0.20:
             logger.info(f"   ✅ Cheap per km (€{self.price/self.km:.2f}) → WATCHLIST")
             self.deal_quality = DealQuality.WATCHLIST
             self.market_analysis = MarketAnalysis(
@@ -662,8 +682,8 @@ class Listing:
             )
             return
         
-        # GEMOTIVEERD + LAAG PRIJS
-        if self.motivated_seller and self.price < 3500:
+        # ✅ VERHOOGD NAAR 4500
+        if self.motivated_seller and self.price < 4500:
             logger.info(f"   ✅ Motivated seller + low price (€{self.price}) → WATCHLIST")
             self.deal_quality = DealQuality.WATCHLIST
             self.market_analysis = MarketAnalysis(
@@ -676,8 +696,8 @@ class Listing:
             )
             return
         
-        # ALLEEN JAAR
-        if self.year and self.price < 2000:
+        # ✅ VERHOOGD NAAR 2500
+        if self.year and self.price < 2500:
             logger.info(f"   ✅ Year + low price (€{self.price}) → WATCHLIST")
             self.deal_quality = DealQuality.WATCHLIST
             self.market_analysis = MarketAnalysis(
@@ -690,7 +710,20 @@ class Listing:
             )
             return
         
-        # ANDERS: GEEN DEAL
+        # ✅ NIEUWE REGEL: GEWOON GOEDKOOP = OK
+        if self.price < 3500:
+            logger.info(f"   👀 Reasonably cheap (€{self.price}) → WATCHLIST")
+            self.deal_quality = DealQuality.WATCHLIST
+            self.market_analysis = MarketAnalysis(
+                asking_price=self.price,
+                market_value=self.price * 1.25,
+                profit_potential=int(self.price * 0.2),
+                profit_percentage=20,
+                is_profitable=True,
+                is_estimated=True,
+            )
+            return
+        
         logger.info(f"   ❌ No conditions met")
         self.deal_quality = DealQuality.POOR
 
@@ -739,13 +772,6 @@ class Listing:
             estimate_note = ""
             if self.market_analysis.is_estimated:
                 estimate_note = "\n⚠️ (Schatting)"
-
-            if self.price < 2000:
-                cost_pct = 3
-            elif self.price < 5000:
-                cost_pct = 6
-            else:
-                cost_pct = 10
 
             market_info = (
                 f"\n\n💰 WINST:\n"
@@ -842,7 +868,6 @@ class SmartClient:
         return ua
 
     def _get_domain(self, url: str) -> str:
-        from urllib.parse import urlparse
         return urlparse(url).netloc
 
     def _get_domain_lock(self, domain: str) -> asyncio.Lock:
@@ -857,12 +882,12 @@ class SmartClient:
         async with lock:
             if domain in self._domain_delays:
                 elapsed = (datetime.now() - self._domain_delays[domain]).total_seconds()
-                if elapsed < 3.0:  # ✅ VERHOOGD VAN 2.5 NAAR 3.0
+                if elapsed < 3.0:
                     await asyncio.sleep(3.0 - elapsed)
             self._domain_delays[domain] = datetime.now()
 
     async def __aenter__(self):
-        connector = aiohttp.TCPConnector(limit=self.config.max_concurrent_requests, limit_per_host=2, ttl_dns_cache=300)  # ✅ VERLAAGD VAN 3 NAAR 2
+        connector = aiohttp.TCPConnector(limit=self.config.max_concurrent_requests, limit_per_host=2, ttl_dns_cache=300)
         timeout = aiohttp.ClientTimeout(total=self.config.request_timeout)
         self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         return self
@@ -905,7 +930,7 @@ class SmartClient:
                             return await response.text()
                         elif response.status == 403:
                             self._stats["blocked"] += 1
-                            wait = min(2 ** attempt * 10, 120)  # ✅ VERHOOGD VAN 5 NAAR 10
+                            wait = min(2 ** attempt * 10, 120)
                             logger.warning(f"⚠️ 403 blocked - waiting {wait}s")
                             self._domain_block_until[domain] = datetime.now() + timedelta(seconds=wait)
                             await asyncio.sleep(wait)
@@ -1032,7 +1057,7 @@ class MarktplaatsRSSMonitor:
         self.filter_config = filter_config
         self._seen_items: Set[str] = set()
         self._use_fallback = False
-        self._seen_items_last_reset = datetime.now()  # ✅ NIEUW
+        self._seen_items_last_reset = datetime.now()
 
     def _maybe_reset_seen_items(self):
         """Reset seen_items elke 1.5 uur om nieuwe listings te vinden"""
@@ -1044,7 +1069,11 @@ class MarktplaatsRSSMonitor:
 
     async def test_api(self, client: 'SmartClient') -> bool:
         """Test API response"""
-        test_url = "https://www.marktplaats.nl/lrp/api/search?query=aygo&limit=10"
+        test_url = build_search_url(
+            "https://www.marktplaats.nl/lrp/api/search",
+            "aygo",
+            limit="10"
+        )
         
         logger.info("🧪 Testing Marktplaats API...")
         data = await client.get_html(test_url)
@@ -1068,10 +1097,14 @@ class MarktplaatsRSSMonitor:
             return False
 
     async def check_rss(self, model: str, client: 'SmartClient') -> List[str]:
-        """Check via API (met debug logging)"""
-        rss_url = (
-            f"https://www.marktplaats.nl/lrp/api/search?"
-            f"query={model}&searchInTitleAndDescription=true&limit=150"
+        """Check via API (met URL encoding)"""
+        
+        # ✅ URL ENCODED
+        rss_url = build_search_url(
+            "https://www.marktplaats.nl/lrp/api/search",
+            model,
+            searchInTitleAndDescription="true",
+            limit="150"
         )
 
         data = await client.get_html(rss_url)
@@ -1110,12 +1143,13 @@ class MarktplaatsRSSMonitor:
         return new_listings
 
     async def check_rss_fallback(self, model: str, client: 'SmartClient') -> List[str]:
-        """Fallback: scrape HTML search page - VERBETERD MET MEERDERE PATTERNS"""
+        """Fallback: scrape HTML search page"""
         
-        self._maybe_reset_seen_items()  # ✅ RESET CHECK
+        self._maybe_reset_seen_items()
         
-        # ✅ SORTEER OP DATUM (nieuwste eerst)
-        search_url = f"https://www.marktplaats.nl/q/{model}/"
+        # ✅ URL ENCODE voor HTML search
+        encoded_model = quote(model)
+        search_url = f"https://www.marktplaats.nl/q/{encoded_model}/"
         
         html = await client.get_html(search_url)
         
@@ -1123,7 +1157,7 @@ class MarktplaatsRSSMonitor:
             logger.warning(f"⚠️ {model}: Geen HTML ontvangen")
             return []
         
-        # ✅ SAVE DEBUG HTML (eerste 5 modellen)
+        # Debug HTML voor eerste paar modellen
         if model in ['aygo', 'yaris', 'c1', '107', 'picanto']:
             debug_file = Path(f"debug_html_{model.replace(' ', '_')}.html")
             try:
@@ -1132,14 +1166,13 @@ class MarktplaatsRSSMonitor:
             except:
                 pass
         
-        # ✅ PROBEER ALLE MOGELIJKE PATTERNS
         patterns = [
             r'href="(/a/[^"]+/m\d+)"',
             r'data-url="(/a/[^"]+/m\d+)"',
             r'"vipUrl":"(/a/[^"]+/m\d+)"',
             r'<a[^>]+href="(/a/[^"]+/m\d+)"',
             r'"url":"(https://www\.marktplaats\.nl/a/[^"]+/m\d+)"',
-            r'href=\\"(/a/[^\\]+/m\d+)\\"',  # Escaped quotes
+            r'href=\\"(/a/[^\\]+/m\d+)\\"',
         ]
         
         all_matches = []
@@ -1147,7 +1180,6 @@ class MarktplaatsRSSMonitor:
             matches = re.findall(pattern, html)
             all_matches.extend(matches)
         
-        # Clean URLs
         cleaned_urls = []
         for match in all_matches:
             if match.startswith('http'):
@@ -1155,7 +1187,6 @@ class MarktplaatsRSSMonitor:
             else:
                 cleaned_urls.append(f"https://www.marktplaats.nl{match}")
         
-        # Verwijder duplicaten MAAR behoud volgorde
         seen = set()
         unique_urls = []
         for url in cleaned_urls:
@@ -1165,7 +1196,6 @@ class MarktplaatsRSSMonitor:
         
         logger.info(f"🔍 {model}: {len(unique_urls)} unieke URLs gevonden in HTML")
         
-        # Filter op NIEUWE listings (niet in _seen_items)
         new_listings = []
         for url in unique_urls[:100]:
             if url not in self._seen_items:
@@ -1297,10 +1327,8 @@ class ProfitScraper:
         return listing
 
     async def scan_model(self, model: str, client: SmartClient) -> List[Listing]:
-        # Probeer eerst API
         new_links = await self.rss_monitor.check_rss(model, client)
         
-        # Als API faalt OF _use_fallback is True, probeer HTML scraping
         if not new_links or self.rss_monitor._use_fallback:
             fallback_links = await self.rss_monitor.check_rss_fallback(model, client)
             new_links.extend(fallback_links)
@@ -1524,23 +1552,9 @@ class ProfitBot:
         logger.info("✅ Startup notification sent")
 
         async with SmartClient(self.bot_config) as client:
-            # ✅ TEST API EERST
             api_works = await self.scraper.rss_monitor.test_api(client)
             if not api_works:
                 logger.warning("⚠️ API test failed - will use HTML fallback for all searches")
-            
-            # ✅ TEST DIRECTE LISTING
-            logger.info("🧪 Testing direct listing URL...")
-            test_url = "https://www.marktplaats.nl/a/auto-s/personenautos/m2100928353-toyota-aygo-1-0-vvt-i-x-play.html"
-            html = await client.get_html(test_url)
-            if html:
-                title, price, desc = ListingParser.parse_marktplaats_json(html)
-                if title and price:
-                    logger.info(f"✅ Direct listing works: {title} - €{price}")
-                else:
-                    logger.warning(f"⚠️ Direct listing returned HTML but parsing failed")
-            else:
-                logger.error(f"❌ Direct listing FAILED - mogelijk IP geblokkeerd!")
             
             while not self._shutdown.is_set():
 
