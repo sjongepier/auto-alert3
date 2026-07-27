@@ -1211,7 +1211,18 @@ class ProfitScraper:
         all_deals = [deal for model_deals in results for deal in model_deals]
 
         logger.info(f"{'='*60}")
-        logger.info(f"✅ SCAN #{self._stats['scans']}: {len(all_deals)} deals")
+        logger.info(f"📊 SCAN RESULTS:")
+        logger.info(f"  Listings checked: {self._stats['listings_checked']}")
+        logger.info(f"  Deals found: {len(all_deals)}")
+        logger.info(f"  Total deals in memory: {len(self.found_deals)}")
+        
+        if len(all_deals) > 0:
+            logger.info(f"✅ DEALS TO SEND:")
+            for deal in all_deals:
+                logger.info(f"  - {deal.deal_quality.value}: {deal.title[:40]} (€{deal.price})")
+        else:
+            logger.info(f"❌ NO DEALS FOUND")
+        
         logger.info(f"{'='*60}\n")
 
         self.price_tracker.cleanup_old()
