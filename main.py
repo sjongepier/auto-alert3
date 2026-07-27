@@ -821,9 +821,9 @@ class SeenLinksManager:
 
 class SmartClient:
     USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     ]
 
     def __init__(self, config: BotConfig):
@@ -857,12 +857,12 @@ class SmartClient:
         async with lock:
             if domain in self._domain_delays:
                 elapsed = (datetime.now() - self._domain_delays[domain]).total_seconds()
-                if elapsed < 2.5:
-                    await asyncio.sleep(2.5 - elapsed)
+                if elapsed < 3.0:  # ✅ VERHOOGD VAN 2.5 NAAR 3.0
+                    await asyncio.sleep(3.0 - elapsed)
             self._domain_delays[domain] = datetime.now()
 
     async def __aenter__(self):
-        connector = aiohttp.TCPConnector(limit=self.config.max_concurrent_requests, limit_per_host=3, ttl_dns_cache=300)
+        connector = aiohttp.TCPConnector(limit=self.config.max_concurrent_requests, limit_per_host=2, ttl_dns_cache=300)  # ✅ VERLAAGD VAN 3 NAAR 2
         timeout = aiohttp.ClientTimeout(total=self.config.request_timeout)
         self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         return self
@@ -891,8 +891,12 @@ class SmartClient:
 
                     headers = {
                         "User-Agent": self._rotate_ua(),
-                        "Accept": "text/html,application/xhtml+xml",
-                        "Accept-Language": "nl-NL,nl;q=0.9",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+                        "Accept-Encoding": "gzip, deflate",
+                        "DNT": "1",
+                        "Connection": "keep-alive",
+                        "Upgrade-Insecure-Requests": "1",
                     }
 
                     async with self._session.get(url, headers=headers, ssl=False) as response:
@@ -901,16 +905,21 @@ class SmartClient:
                             return await response.text()
                         elif response.status == 403:
                             self._stats["blocked"] += 1
-                            wait = min(2 ** attempt * 5, 60)
+                            wait = min(2 ** attempt * 10, 120)  # ✅ VERHOOGD VAN 5 NAAR 10
+                            logger.warning(f"⚠️ 403 blocked - waiting {wait}s")
                             self._domain_block_until[domain] = datetime.now() + timedelta(seconds=wait)
                             await asyncio.sleep(wait)
                         elif response.status in (429, 503):
-                            await asyncio.sleep(2 ** attempt)
+                            wait = 2 ** attempt
+                            logger.warning(f"⚠️ Rate limit {response.status} - waiting {wait}s")
+                            await asyncio.sleep(wait)
                         else:
+                            logger.warning(f"⚠️ HTTP {response.status} for {url}")
                             return None
 
                 except Exception as e:
                     self._stats["errors"] += 1
+                    logger.debug(f"Request error (attempt {attempt}): {e}")
                     if attempt < self.config.max_retries:
                         await asyncio.sleep(2 ** attempt)
 
@@ -1023,6 +1032,15 @@ class MarktplaatsRSSMonitor:
         self.filter_config = filter_config
         self._seen_items: Set[str] = set()
         self._use_fallback = False
+        self._seen_items_last_reset = datetime.now()  # ✅ NIEUW
+
+    def _maybe_reset_seen_items(self):
+        """Reset seen_items elke 1.5 uur om nieuwe listings te vinden"""
+        if datetime.now() - self._seen_items_last_reset > timedelta(hours=1.5):
+            old_count = len(self._seen_items)
+            self._seen_items = set()
+            self._seen_items_last_reset = datetime.now()
+            logger.info(f"🔄 RESET seen_items ({old_count} items cleared)")
 
     async def test_api(self, client: 'SmartClient') -> bool:
         """Test API response"""
@@ -1070,7 +1088,6 @@ class MarktplaatsRSSMonitor:
             
             if len(listings) == 0:
                 logger.warning(f"⚠️ {model}: API returned 0 listings")
-                logger.debug(f"Response preview: {data[:500]}")
             else:
                 logger.info(f"📡 {model}: {len(listings)} listings from API")
 
@@ -1089,32 +1106,76 @@ class MarktplaatsRSSMonitor:
 
         except Exception as e:
             logger.error(f"❌ RSS parse error for {model}: {e}")
-            logger.debug(f"Raw response: {data[:200]}")
 
         return new_listings
 
     async def check_rss_fallback(self, model: str, client: 'SmartClient') -> List[str]:
-        """Fallback: scrape HTML search page"""
+        """Fallback: scrape HTML search page - VERBETERD MET MEERDERE PATTERNS"""
         
+        self._maybe_reset_seen_items()  # ✅ RESET CHECK
+        
+        # ✅ SORTEER OP DATUM (nieuwste eerst)
         search_url = f"https://www.marktplaats.nl/q/{model}/"
+        
         html = await client.get_html(search_url)
         
         if not html:
             logger.warning(f"⚠️ {model}: Geen HTML ontvangen")
             return []
         
-        # Extract listing URLs from HTML
-        pattern = r'href="(/a/[^"]+/m\d+)"'
-        matches = re.findall(pattern, html)
+        # ✅ SAVE DEBUG HTML (eerste 5 modellen)
+        if model in ['aygo', 'yaris', 'c1', '107', 'picanto']:
+            debug_file = Path(f"debug_html_{model.replace(' ', '_')}.html")
+            try:
+                debug_file.write_text(html[:20000])
+                logger.info(f"💾 Debug HTML saved: {debug_file}")
+            except:
+                pass
         
+        # ✅ PROBEER ALLE MOGELIJKE PATTERNS
+        patterns = [
+            r'href="(/a/[^"]+/m\d+)"',
+            r'data-url="(/a/[^"]+/m\d+)"',
+            r'"vipUrl":"(/a/[^"]+/m\d+)"',
+            r'<a[^>]+href="(/a/[^"]+/m\d+)"',
+            r'"url":"(https://www\.marktplaats\.nl/a/[^"]+/m\d+)"',
+            r'href=\\"(/a/[^\\]+/m\d+)\\"',  # Escaped quotes
+        ]
+        
+        all_matches = []
+        for pattern in patterns:
+            matches = re.findall(pattern, html)
+            all_matches.extend(matches)
+        
+        # Clean URLs
+        cleaned_urls = []
+        for match in all_matches:
+            if match.startswith('http'):
+                cleaned_urls.append(match)
+            else:
+                cleaned_urls.append(f"https://www.marktplaats.nl{match}")
+        
+        # Verwijder duplicaten MAAR behoud volgorde
+        seen = set()
+        unique_urls = []
+        for url in cleaned_urls:
+            if url not in seen:
+                seen.add(url)
+                unique_urls.append(url)
+        
+        logger.info(f"🔍 {model}: {len(unique_urls)} unieke URLs gevonden in HTML")
+        
+        # Filter op NIEUWE listings (niet in _seen_items)
         new_listings = []
-        for path in matches[:25]:  # Limit to first 25
-            url = f"https://www.marktplaats.nl{path}"
+        for url in unique_urls[:100]:
             if url not in self._seen_items:
                 self._seen_items.add(url)
                 new_listings.append(url)
         
-        logger.info(f"🔎 {model}: {len(new_listings)} nieuwe listings (HTML fallback)")
+        if len(new_listings) == 0 and len(unique_urls) > 0:
+            logger.warning(f"⚠️ {model}: {len(unique_urls)} URLs maar allemaal AL GEZIEN")
+        
+        logger.info(f"🔎 {model}: {len(new_listings)} NIEUWE listings (HTML)")
         return new_listings
 
 class ProfitScraper:
@@ -1463,10 +1524,23 @@ class ProfitBot:
         logger.info("✅ Startup notification sent")
 
         async with SmartClient(self.bot_config) as client:
-            # TEST API EERST
+            # ✅ TEST API EERST
             api_works = await self.scraper.rss_monitor.test_api(client)
             if not api_works:
                 logger.warning("⚠️ API test failed - will use HTML fallback for all searches")
+            
+            # ✅ TEST DIRECTE LISTING
+            logger.info("🧪 Testing direct listing URL...")
+            test_url = "https://www.marktplaats.nl/a/auto-s/personenautos/m2100928353-toyota-aygo-1-0-vvt-i-x-play.html"
+            html = await client.get_html(test_url)
+            if html:
+                title, price, desc = ListingParser.parse_marktplaats_json(html)
+                if title and price:
+                    logger.info(f"✅ Direct listing works: {title} - €{price}")
+                else:
+                    logger.warning(f"⚠️ Direct listing returned HTML but parsing failed")
+            else:
+                logger.error(f"❌ Direct listing FAILED - mogelijk IP geblokkeerd!")
             
             while not self._shutdown.is_set():
 
